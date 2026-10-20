@@ -1,0 +1,21 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j"$(nproc)" all tests
+      - name: Unit tests
+        env:
+          OMP_NUM_THREADS: 2
+        run: make check
+      - name: Smoke run (rising bubble, coarse, short)
+        env:
+          OMP_NUM_THREADS: 2
+        run: ./bin/vof2d cases/rising_bubble.cfg maxLevel=5 tEnd=0.2 outputEvery=0 outDir=ci_out

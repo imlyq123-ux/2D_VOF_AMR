@@ -1,0 +1,20 @@
+# build products
+/build/
+/bin/
+
+# simulation output (VTK files, diagnostics, videos)
+/output/
+*.vtu
+*.vtp
+*.pvd
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
