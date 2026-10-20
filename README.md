@@ -222,6 +222,72 @@ docs/ARCHITECTURE.md  design notes and conventions
 * `docs/images/breaking_wave_energy.png` — breaking wave after 4 periods: AMR grid, fields
   and the energy budget against Deike et al. (2015)
 
+## Acknowledgements and references
+
+This is an independent C++ implementation (no third-party source code), but its design
+follows closely the methods of [Basilisk](http://basilisk.fr) and Gerris by Stéphane
+Popinet: cell-based quadtree AMR with composite operators, collocated approximate
+projection with balanced-force surface tension, height-function curvature, conservative
+split VOF, momentum-conserving two-phase transport and wavelet-based adaptation.
+
+**Adaptive solver framework**
+- S. Popinet, Gerris: a tree-based adaptive solver for the incompressible Euler equations
+  in complex geometries, *J. Comput. Phys.* 190 (2003) 572–600.
+- S. Popinet, An accurate adaptive solver for surface-tension-driven interfacial flows,
+  *J. Comput. Phys.* 228 (2009) 5838–5866 (balanced force, height functions).
+- S. Popinet, A quadtree-adaptive multigrid solver for the Serre–Green–Naghdi equations,
+  *J. Comput. Phys.* 302 (2015) 336–358 (Basilisk).
+
+**Volume of fluid**
+- R. Scardovelli, S. Zaleski, Analytical relations connecting linear interfaces and volume
+  fractions in rectangular grids, *J. Comput. Phys.* 164 (2000) 228–237.
+- E. Aulisa, S. Manservisi, R. Scardovelli, S. Zaleski, Interface reconstruction with
+  least-squares fit and split advection in three-dimensional Cartesian geometry,
+  *J. Comput. Phys.* 225 (2007) 2301–2319 (Mixed-Youngs-Centered normals).
+- G. D. Weymouth, D. K.-P. Yue, Conservative Volume-of-Fluid method for free-surface
+  simulations on Cartesian-grids, *J. Comput. Phys.* 229 (2010) 2853–2865.
+- M. Rudman, A volume-tracking method for incompressible multifluid flows with large
+  density variations, *Int. J. Numer. Meth. Fluids* 28 (1998) 357–378 (consistent momentum
+  transport).
+
+**Surface tension and Navier–Stokes**
+- J. U. Brackbill, D. B. Kothe, C. Zemach, A continuum method for modeling surface
+  tension, *J. Comput. Phys.* 100 (1992) 335–354.
+- M. M. Francois et al., A balanced-force algorithm for continuous and sharp interfacial
+  surface tension models within a volume tracking framework, *J. Comput. Phys.* 213 (2006)
+  141–173.
+- J. B. Bell, P. Colella, H. M. Glaz, A second-order projection method for the
+  incompressible Navier–Stokes equations, *J. Comput. Phys.* 85 (1989) 257–283.
+
+**Linear solver**
+- Y. Notay, Flexible conjugate gradients, *SIAM J. Sci. Comput.* 22 (2000) 1444–1460.
+- Y. Notay, P. S. Vassilevski, Recursive Krylov-based multigrid cycles, *Numer. Linear
+  Algebra Appl.* 15 (2008) 473–487 (K-cycle).
+- Y. Notay, An aggregation-based algebraic multigrid method, *Electron. Trans. Numer.
+  Anal.* 37 (2010) 123–146.
+
+**Test cases and reference data**
+- S. Hysing et al., Quantitative benchmark computations of two-dimensional bubble
+  dynamics, *Int. J. Numer. Meth. Fluids* 60 (2009) 1259–1288 (`rising_bubble`, `rising_bubble2`).
+- L. Deike, S. Popinet, W. K. Melville, Capillary effects on wave breaking, *J. Fluid
+  Mech.* 769 (2015) 541–569 (`breaking_wave`; energy dissipation data); H. Lamb,
+  *Hydrodynamics*, 6th ed., Cambridge University Press (1932) (third-order Stokes wave,
+  drop oscillations).
+- G. Chen, C. Kharif, S. Zaleski, J. Li, Two-dimensional Navier–Stokes simulation of
+  breaking waves, *Phys. Fluids* 11 (1999) 121–133; A. Iafrati, Energy dissipation
+  mechanisms in wave breaking processes: spilling and highly aerated plunging breaking
+  events, *J. Geophys. Res.* 116 (2011) C07024 (energy loss values quoted by Deike et al.).
+- G. Tryggvason, Numerical simulations of the Rayleigh–Taylor instability, *J. Comput.
+  Phys.* 75 (1988) 253–282 (`rayleigh_taylor`).
+- J. C. Martin, W. J. Moyce, An experimental study of the collapse of liquid columns on a
+  rigid horizontal plane, *Phil. Trans. R. Soc. Lond. A* 244 (1952) 312–324 (`dam_break`).
+- S. T. Zalesak, Fully multidimensional flux-corrected transport algorithms for fluids,
+  *J. Comput. Phys.* 31 (1979) 335–362 (`zalesak`); W. J. Rider, D. B. Kothe,
+  Reconstructing volume tracking, *J. Comput. Phys.* 141 (1998) 112–152 (`single_vortex`).
+- U. Ghia, K. N. Ghia, C. T. Shin, High-Re solutions for incompressible flow using the
+  Navier–Stokes equations and a multigrid method, *J. Comput. Phys.* 48 (1982) 387–411
+  (lid-driven cavity test).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
