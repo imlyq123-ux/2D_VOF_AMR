@@ -66,6 +66,81 @@ python3 scripts/make_video.py output/rising_bubble                          # MP
 python3 scripts/make_video.py output/static_drop --field3 speed --log --diag umax --diag-log --normalize-arrows
 ```
 
+## Gallery
+
+Each animation shows, left to right: the AMR grid coloured by refinement level (red: PLIC
+interface), the volume fraction with velocity arrows, a flow field, and time series.
+Click an animation for the full-resolution MP4. The raw data (VTK files, diagnostics)
+are not in the repository; the commands below regenerate them.
+
+### Rising bubble (Hysing et al. 2009, test case 1)
+
+[![rising bubble](docs/media/rising_bubble.gif)](docs/media/rising_bubble.mp4)
+
+A light bubble (ρ 1000/100, μ 10/1, σ 24.5) rises and deforms into a skirted cap; the
+interface band stays at level 7 while the wake and the side gaps refine with the flow
+(3,400 → 6,200 leaves). Max rise velocity 0.2421 (ref. 0.2417), min circularity 0.9007
+(ref. 0.9013), centroid y(3) = 1.0823 (ref. 1.0813).
+
+```bash
+./bin/vof2d cases/rising_bubble.cfg maxLevel=7 outputEvery=0.02 outDir=output/video_rising_bubble
+python3 scripts/make_video.py output/video_rising_bubble
+```
+
+### Static drop (spurious currents)
+
+[![static drop](docs/media/static_drop.gif)](docs/media/static_drop.mp4)
+
+A drop at rest (La = 12000): the parasitic currents of the start-up transient decay from
+8e-4 to ~2e-8 (log-scale speed in the third panel, arrow directions only). The grid does not
+change because nothing moves.
+
+```bash
+./bin/vof2d cases/static_drop.cfg outputEvery=0.05 outDir=output/video_static_drop
+python3 scripts/make_video.py output/video_static_drop --field3 speed --log --diag umax --diag-log --normalize-arrows
+```
+
+### Oscillating drop (capillary mode 2)
+
+[![oscillating drop](docs/media/oscillating_drop.gif)](docs/media/oscillating_drop.mp4)
+
+An elliptic drop (10 % deformation, density ratio 100) oscillates under surface tension; the
+far-field grid refines and coarsens with every swing. Period 0.2350 vs 0.2306 (linear theory),
+damping rate 0.209 vs ≈ 0.20.
+
+```bash
+./bin/vof2d cases/oscillating_drop.cfg outputEvery=0.01 outDir=output/video_oscillating_drop
+python3 scripts/make_video.py output/video_oscillating_drop --field3 speed --diag ekin --fps 20
+```
+
+### Rayleigh–Taylor instability (At = 0.5, Re = 3000)
+
+[![Rayleigh-Taylor](docs/media/rayleigh_taylor.gif)](docs/media/rayleigh_taylor.mp4)
+
+Heavy fluid falls into light fluid: mushroom, Kelvin–Helmholtz roll-ups, impact on the
+bottom wall and mixing (t = 6). The finest-level band follows the stretching interface
+(2,300 → 41,000 leaves) while the undisturbed fluid stays coarse.
+
+```bash
+./bin/vof2d cases/rayleigh_taylor.cfg tEnd=6 outputEvery=0.025 outDir=output/video_rayleigh_taylor
+python3 scripts/make_video.py output/video_rayleigh_taylor --height 10 --dpi 100 --arrows 10 --diag ekin
+```
+
+### Breaking wave (Deike, Popinet & Melville 2015)
+
+[![breaking wave](docs/media/breaking_wave.gif)](docs/media/breaking_wave.mp4)
+
+A steep Stokes wave (ε = 0.55, Re = 40000, Bo = 1000, density ratio 850) overturns, plunges,
+traps air and breaks up over 4 wave periods (levels 4–9, momentum-conserving advection).
+The top-right panel compares the energy budget with the literature: 84 % of the wave energy
+dissipated after 4 periods vs ≈ 70 % in Deike et al. (Chen et al. 1999: ≈ 80 %, Iafrati
+2011: ≈ 60 %).
+
+```bash
+./bin/vof2d cases/breaking_wave.cfg outDir=output/breaking_wave_deike2015
+python3 scripts/make_video.py output/breaking_wave_deike2015 --wave-energy --fps 20 --dpi 100 --arrows 16 --arrow-umax 1.0
+```
+
 ## Validation (results from this code)
 
 Hysing et al. (2009) rising bubble, test case 1 (reference: TP2D):

@@ -8,6 +8,7 @@
 *.vtp
 *.pvd
 *.mp4
+!docs/media/*.mp4
 
 # Python
 __pycache__/
