@@ -145,6 +145,7 @@ void forEachParam(P& p, Fn&& fn) {
 
     fn("linear solver", "poissonTol", p.poissonTol, "relative residual tolerance");
     fn(nullptr, "poissonMaxIter", p.poissonMaxIter, "maximum iterations");
+    fn(nullptr, "gpu", p.gpu, "linear solves on the CUDA device (CUDA builds, true/false)");
 
     fn("kinematic runs (prescribed stream function, no Navier-Stokes)", "vofOnly", p.vofOnly,
        "advect f with the case's stream function only");

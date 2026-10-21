@@ -210,11 +210,25 @@ void run(State& s, const cases::CaseSetup& cs) {
     if (doOutput) output();
     double nextOut = doOutput ? prm.outputEvery : prm.tEnd;
 
+    const std::string gpuDev = prm.gpu && !prm.vofOnly ? poisson::gpuDevice() : "";  // initializes CUDA
+
     using clock = std::chrono::steady_clock;
     const auto tStart = clock::now();
     auto tLast = tStart;
     std::printf("case %s: %d leaves (levels %d..%d), tEnd = %g\n", prm.caseName.c_str(),
                 s.m().nLeaves(), prm.minLevel, prm.maxLevel, prm.tEnd);
+    if (prm.gpu && !prm.vofOnly) {
+        if (!gpuDev.empty())
+            std::printf("linear solver on the GPU: %s\n", gpuDev.c_str());
+        else
+            std::fprintf(stderr, "warning: gpu = true, but %s; linear solves run on the CPU\n",
+#ifdef VOF2D_CUDA
+                         "no usable CUDA device was found"
+#else
+                         "this is a CPU-only build (make CUDA=1)"
+#endif
+            );
+    }
     while (s.t < prm.tEnd - 1e-12 && s.step < prm.maxSteps) {
         const double target = std::min(nextOut, prm.tEnd);
         step(s, cs, target - s.t);

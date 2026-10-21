@@ -1,7 +1,7 @@
 # vof2d — architecture
 
 2D incompressible two-phase flow, geometric VOF (PLIC), quadtree AMR, C++17, no
-external libraries (OpenMP optional).
+external libraries (OpenMP optional, CUDA optional for the linear solves).
 
 ## Modules and ownership
 
@@ -10,7 +10,7 @@ external libraries (OpenMP optional).
 | Mesh / AMR core   | `src/mesh.cpp`                                     | `src/mesh.hpp`       |
 | VOF (PLIC + advection) | `src/plic.hpp`, `src/plic.cpp`, `src/vof.cpp` | `src/vof.hpp`        |
 | Curvature         | `src/curvature.cpp`                                | `src/curvature.hpp`  |
-| Linear solver     | `src/poisson.cpp`                                  | `src/poisson.hpp`    |
+| Linear solver     | `src/poisson.cpp`, `src/poisson_gpu.cu` (CUDA=1)   | `src/poisson.hpp`    |
 | Navier–Stokes     | `src/navier_stokes.cpp`                            | `src/navier_stokes.hpp` |
 | I/O, config, cases| `src/io.cpp`, `src/cases.cpp`, `scripts/`, `cases/`| `src/io.hpp`, `src/cases.hpp` |
 | AMR criteria, driver | `src/amr.cpp`, `src/simulation.cpp`, `src/main.cpp` | `src/amr.hpp`, `src/simulation.hpp` |
@@ -78,3 +78,23 @@ the predicted velocity there was tried and makes static-drop spurious currents g
   to `maxLevel` (so VOF/curvature stencils never see a resolution jump);
 * elsewhere, a wavelet estimate of u, v (difference between the leaf values and the
   prolongation from the parent) refines above `uTol` and coarsens below `uTol/1.5`.
+
+## GPU linear solver (src/poisson_gpu.cu, `make CUDA=1`)
+
+`poisson::solve` assembles the system (the matrix pattern is cached per
+`Mesh::revision()`) and builds the AMG hierarchy on the host. With `Options::gpu`
+(`Params::gpu`) and at least `kGpuMin` unknowns it hands the hierarchy to
+`poisson::gpu::solve`, which
+
+* colours every level greedily and renumbers its rows colour by colour (each colour of
+  the multicolour Gauss-Seidel smoother is then a contiguous, parallel phase);
+* uploads everything in one copy and runs FCG + K-cycle in ONE cooperative kernel:
+  large levels use the whole grid with grid barriers, levels of <= `kBlockRows` rows run
+  on block 0 alone; all scalars come from deterministic reductions so every thread takes
+  the same branches;
+* inverts the coarsest matrix on the device from the host Cholesky factor.
+
+Below level `kGpuAggressive` the GPU hierarchy uses triple pairwise aggregation: the
+K-cycle visits level l up to 2^l times and a visit of a small level costs a few
+microseconds of barrier latency whatever its size, so fewer levels are faster. The CPU
+path is unchanged (bitwise) by the GPU option.

@@ -1,7 +1,7 @@
 # vof2d — 2D two-phase flow with VOF and quadtree AMR
 
 Incompressible two-phase Navier–Stokes solver in C++17 (no external libraries, optional
-OpenMP):
+OpenMP, optional CUDA for the linear solves):
 
 * **Interface**: geometric VOF — PLIC reconstruction with Mixed-Youngs-Centered normals,
   Weymouth & Yue (2010) conservative, bounded, directionally split advection.
@@ -20,7 +20,8 @@ OpenMP):
   per step (~1.9× cost). The VOF step always uses the exactly balanced face velocity of
   the last projection (keeps the balanced-force equilibrium of static interfaces).
 * **Pressure**: flexible CG preconditioned by aggregation AMG (K-cycle); ~15–25
-  iterations independent of mesh size and density ratio.
+  iterations independent of mesh size and density ratio. With `make CUDA=1` the
+  pressure and implicit-viscosity solves run on an NVIDIA GPU (see [GPU](#gpu-cuda)).
 * **AMR**: cell-based quadtree, 2:1 balanced (incl. corners), O(1) neighbour lookup.
   The interface is always at the finest level with a buffer; elsewhere the mesh follows
   a wavelet estimate of the velocity. All operators are face-flux based, so they are
@@ -31,6 +32,9 @@ OpenMP):
 ```bash
 make -j            # bin/vof2d
 make check         # builds and runs all unit tests (~35 s)
+
+make -j CUDA=1     # same, with the CUDA linear solver (needs nvcc, see below)
+make CUDA=1 check  # also checks the GPU solver against the CPU one
 ```
 
 ## Run
@@ -65,6 +69,47 @@ python3 scripts/plot_diagnostics.py output/rising_bubble/diagnostics.dat   # ove
 python3 scripts/make_video.py output/rising_bubble                          # MP4: grid + f + vorticity (needs ffmpeg)
 python3 scripts/make_video.py output/static_drop --field3 speed --log --diag umax --diag-log --normalize-arrows
 ```
+
+## GPU (CUDA)
+
+`make CUDA=1` builds `bin/vof2d` with a CUDA backend for the elliptic solves (pressure
+projection, MAC predictor, implicit viscosity), which take ~75 % of a time step on the CPU.
+The rest of the step (VOF advection, curvature, momentum, AMR) stays on the CPU (OpenMP).
+
+```bash
+make clean && make -j CUDA=1                       # CUDA_HOME: from nvcc in PATH, else /usr/local/cuda
+make -j CUDA=1 CUDA_HOME=$HOME/.local/cuda-12.9    # toolkit elsewhere
+make -j CUDA=1 CUDA_ARCH=sm_86                     # default: native (the GPU of the build machine)
+./bin/vof2d cases/rising_bubble.cfg maxLevel=10 minLevel=8              # GPU (default in CUDA builds)
+./bin/vof2d cases/rising_bubble.cfg maxLevel=10 minLevel=8 gpu=false    # CPU only
+```
+
+* `gpu = true` is the default of CUDA builds; without a usable device, or in a CPU-only
+  build, the run prints a warning and solves on the CPU. Systems with fewer than 30,000
+  unknowns are always solved on the CPU (the GPU does not pay off there).
+* The assembly and the AMG hierarchy are built on the host as for the CPU solver; the whole
+  flexible-CG / K-cycle iteration runs in a single cooperative kernel (no per-operation
+  launches or host round trips, which matters especially under WSL). Differences to the
+  CPU solver: multicolour Gauss–Seidel smoothing, and aggregates of up to 8 cells (instead
+  of 4) below the second level, which halves the number of latency-bound coarse-level
+  visits of the K-cycle. Iteration counts stay within ~10 % of the CPU ones, and the
+  solutions agree to the solver tolerance (`tests/test_poisson.cpp`).
+* Only the toolkit's `nvcc` and the CUDA runtime (linked statically) are needed; the
+  device code takes about a minute to compile.
+
+Measured on an RTX 4060 Ti (WSL2), host part with `OMP_NUM_THREADS=4`, 40 steps:
+
+| run | leaves | CPU ms/step | GPU ms/step |
+|-----|-------:|------------:|------------:|
+| `rising_bubble.cfg minLevel=7 maxLevel=9` | 44,060 | 44.5 | 30.6 |
+| `dam_break.cfg minLevel=8 maxLevel=10` | 72,448 | 60.9 | 49.5 |
+| `rayleigh_taylor.cfg minLevel=7 maxLevel=9` | 72,460 | 75.3 | 58.7 |
+| `breaking_wave.cfg minLevel=8 maxLevel=10` | 81,064 | 114.8 | 81.9 |
+| `rising_bubble.cfg minLevel=9 maxLevel=11` | 569,252 | 489 | 271 |
+
+For a single solve the GPU is 2.5–4× faster than one CPU core on 0.3–1 M unknowns
+(`bin/test_poisson --bench` vs `--bench --gpu`); end to end, the host part (assembly, AMG setup, the rest of the time
+step) limits the gain. The default cases (a few thousand leaves) run entirely on the CPU.
 
 ## Gallery
 
@@ -188,6 +233,7 @@ src/amr.*           refinement criterion (interface band + velocity wavelets)
 src/plic.*, vof.*   PLIC geometry, reconstruction, advection, VOF prolongation
 src/curvature.*     height-function curvature
 src/poisson.*       AMG-preconditioned CG for -div(beta grad x) + lambda x = b
+src/poisson_gpu.*   CUDA backend of the same solver (make CUDA=1)
 src/navier_stokes.* momentum predictor, balanced-force projection, time-step control
 src/io.*, cases.*   config, VTK output, diagnostics, test cases
 src/simulation.*    initialization, time step sequence, run loop
@@ -210,6 +256,7 @@ docs/ARCHITECTURE.md  design notes and conventions
   ~5e-10 by t = 7 before the drift starts. Irrelevant for flows that are not at rest.
 * Contact lines: walls act as a 90° contact angle.
 * For small meshes (< ~10^4 leaves) OpenMP brings little; use `OMP_NUM_THREADS=1..4`.
+* CUDA: only the linear solves run on the GPU, and only for systems of ≥ 30,000 unknowns.
 * Memory: per-level dense index maps (4 bytes × (nx0·ny0·4^maxLevel) at the finest
   level), fine up to maxLevel ≈ 11–12 in 2D.
 

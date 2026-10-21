@@ -19,6 +19,7 @@
 // the solver removes the volume-weighted mean of b (compatibility) and returns the
 // solution with zero volume-weighted mean.
 #pragma once
+#include <string>
 #include <vector>
 #include "mesh.hpp"
 
@@ -40,6 +41,10 @@ struct Options {
     // Preconditioner (added by the linear-solver module):
     //   1 = aggregation AMG, K-cycle (default);  0 = Jacobi (simple fallback).
     int precond = 1;
+    // Run the iteration on the CUDA device (CUDA builds only; ignored otherwise). Systems
+    // smaller than a few ten thousand unknowns, for which the GPU does not pay off, are
+    // still solved on the CPU.
+    bool gpu = false;
 };
 
 struct Result {
@@ -49,7 +54,12 @@ struct Result {
 };
 
 // x: per cell index (size nCells); on input the initial guess (leaf entries), on output
-// the solution. Non-leaf entries are left untouched.
+// the solution. Non-leaf entries are left untouched. Not reentrant (the matrix pattern of
+// the last mesh and the GPU buffers are kept between calls).
 Result solve(const Mesh& m, const Problem& prob, std::vector<double>& x, const Options& opt);
+
+// Name of the CUDA device used for Options::gpu, or "" if there is none (CPU-only build or
+// no usable device; the solver then runs on the CPU).
+std::string gpuDevice();
 
 }  // namespace poisson

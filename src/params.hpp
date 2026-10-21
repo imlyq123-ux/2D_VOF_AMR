@@ -57,6 +57,13 @@ struct Params {
     // ---- linear solver
     double poissonTol = 1e-9;   // relative residual
     int poissonMaxIter = 1000;
+    // linear solves on the CUDA device (CUDA builds: make CUDA=1; small systems stay on
+    // the CPU, see poisson.hpp); ignored with a warning in CPU-only builds
+#ifdef VOF2D_CUDA
+    bool gpu = true;
+#else
+    bool gpu = false;
+#endif
 
     // ---- kinematic-only runs (prescribed velocity from a stream function, no NS solve)
     bool vofOnly = false;

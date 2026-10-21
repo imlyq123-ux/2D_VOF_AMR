@@ -19,3 +19,19 @@ jobs:
         env:
           OMP_NUM_THREADS: 2
         run: ./bin/vof2d cases/rising_bubble.cfg maxLevel=5 tEnd=0.2 outputEvery=0 outDir=ci_out
+
+  cuda-build:
+    # compiles the CUDA backend (no GPU on the runner: the GPU tests are skipped and the
+    # solver falls back to the CPU)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: apt-get update && apt-get install -y --no-install-recommends make g++
+      - name: Build
+        run: make -j"$(nproc)" CUDA=1 CUDA_ARCH=sm_80 all tests
+      - name: Unit tests
+        env:
+          OMP_NUM_THREADS: 2
+        run: make CUDA=1 CUDA_ARCH=sm_80 check

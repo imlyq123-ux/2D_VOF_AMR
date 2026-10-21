@@ -245,6 +245,7 @@ poisson::Result projectFaces(State& s, double dt, bool withAccel, std::vector<do
     poisson::Options opt;
     opt.tol = prm.poissonTol;
     opt.maxIter = prm.poissonMaxIter;
+    opt.gpu = prm.gpu;
     if ((int)p.size() != m.nCells()) p.assign(m.nCells(), 0.0);
     const poisson::Result r = poisson::solve(m, P, p, opt);
 
@@ -582,6 +583,7 @@ void advanceMomentum(State& s, double dt) {
         poisson::Options opt;
         opt.tol = prm.poissonTol;
         opt.maxIter = prm.poissonMaxIter;
+        opt.gpu = prm.gpu;
         // Mass-dominated (h^2 rho / (mu dt) not small): Jacobi-PCG converges in a few tens
         // of iterations and avoids the AMG setup cost; otherwise use the default (AMG).
         double ratio = std::numeric_limits<double>::max();

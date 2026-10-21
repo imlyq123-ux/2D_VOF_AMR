@@ -2,6 +2,7 @@
 #include "mesh.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <sstream>
 #include <stdexcept>
 
@@ -114,6 +115,8 @@ void Mesh::prolongLinear(const Mesh& m, const std::vector<double>& d, int p, dou
 // ------------------------------------------------------------------ rebuild
 
 void Mesh::rebuild(const std::vector<std::vector<uint8_t>>& exists) {
+    static std::atomic<uint64_t> lastRevision{0};
+    revision_ = ++lastRevision;
     const int Lmax = cfg_.maxLevel;
     // keep old state for field transfer
     std::vector<std::vector<int>> oldMap;

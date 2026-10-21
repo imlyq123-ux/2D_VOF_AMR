@@ -1,6 +1,7 @@
 // test_poisson.cpp - elliptic solver: manufactured solutions (uniform / AMR, Dirichlet /
-// Neumann), jump coefficients (density ratio 1000), symmetry, Helmholtz, fallback.
-// Usage: test_poisson [--bench]   (exit 0 on success)
+// Neumann), jump coefficients (density ratio 1000), symmetry, Helmholtz, fallback, and
+// (CUDA builds with a device) the GPU solver against the CPU one.
+// Usage: test_poisson [--bench [--gpu]]   (exit 0 on success)
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -386,8 +387,89 @@ void testMisc() {
     std::printf("  failure reporting, zero rhs, tiny periodic mesh, non-leaf entries: checked\n");
 }
 
-void bench() {
-    std::printf("Benchmark (tol 1e-9, zero initial guess; times include setup):\n");
+// CUDA backend: same answers as the CPU solver (Options::gpu), on systems large enough
+// to be sent to the device. Skipped without a usable device.
+void testGpu() {
+    std::printf("GPU solver:\n");
+    if (poisson::gpuDevice().empty()) {
+        std::printf("  skipped (CPU-only build or no CUDA device)\n");
+        return;
+    }
+    std::printf("  device: %s\n", poisson::gpuDevice().c_str());
+    auto compare = [](const char* what, const Mesh& m, const poisson::Problem& p, poisson::Options o,
+                      bool singular) {
+        std::vector<double> xc(m.nCells(), 0.0), xg(m.nCells(), 0.0);
+        o.gpu = false;
+        const poisson::Result rc = poisson::solve(m, p, xc, o);
+        o.gpu = true;
+        const poisson::Result rg = poisson::solve(m, p, xg, o);
+        double d = 0, s = 0;
+        for (int c : m.leaves()) { d = std::max(d, std::fabs(xc[c] - xg[c])); s = std::max(s, std::fabs(xc[c])); }
+        const double chk = checkResidual(m, p, xg, singular);
+        std::printf("  %-38s leaves=%6d iter cpu %3d gpu %3d  check=%.1e  max diff / max = %.1e\n", what,
+                    m.nLeaves(), rc.iterations, rg.iterations, chk, d / s);
+        expect(rg.converged && chk < 1e-8, "GPU solve converged");
+        expect(d / s < 1e-6, "GPU solution agrees with the CPU one");
+        expect(rg.iterations <= rc.iterations + rc.iterations / 2 + 2, "GPU iteration count");
+        return xg;
+    };
+    auto rhsOf = [](const Mesh& m) {
+        std::vector<double> b(m.nCells(), 0.0);
+        for (int c : m.leaves()) {
+            const Vec2 x = m.center(c);
+            b[c] = std::sin(3 * PI * x.x) * std::cos(2 * PI * x.y) + ((c * 7919) % 13) * 0.01;
+        }
+        return b;
+    };
+    auto um = uniformMesh(8);
+    auto am = amrMesh(11, 5, 5.0);
+    poisson::Problem p;
+    // pure Neumann (singular), density ratio 1000
+    p.beta = jumpBeta(*um, 1.0, 1000.0);
+    p.rhs = rhsOf(*um);
+    compare("uniform, jump 1000, Neumann", *um, p, poisson::Options(), true);
+    p.beta = jumpBeta(*am, 1.0, 1000.0);
+    p.rhs = rhsOf(*am);
+    const std::vector<double> xa = compare("AMR, jump 1000, Neumann", *am, p, poisson::Options(), true);
+    // a converged initial guess is accepted as is; non-leaf entries are untouched
+    std::vector<double> x0 = xa;
+    for (int c = 0; c < am->nCells(); ++c) if (!am->isLeaf(c)) x0[c] = 42.0;
+    poisson::Options og;
+    og.gpu = true;
+    const poisson::Result r0 = poisson::solve(*am, p, x0, og);
+    bool untouched = true;
+    for (int c = 0; c < am->nCells(); ++c) if (!am->isLeaf(c) && x0[c] != 42.0) untouched = false;
+    expect(r0.converged && r0.iterations == 0 && untouched, "GPU: initial guess, non-leaf entries");
+    // Dirichlet data + Helmholtz term (implicit viscosity), AMG and Jacobi preconditioners
+    auto ue = [](Vec2 q) { return std::sin(PI * q.x + 0.4) * std::cos(1.3 * PI * q.y); };
+    for (double lam : {1e2, 1e5}) {
+        auto f = [&](Vec2 q) { return (PI * PI * 2.69 + lam) * ue(q); };
+        poisson::Problem ph = manufactured(*am, true, lam, ue, f);
+        poisson::Options o;
+        o.precond = lam > 1e3 ? 0 : 1;
+        compare(lam > 1e3 ? "AMR, Helmholtz 1e5, Dirichlet, Jacobi" : "AMR, Helmholtz 1e2, Dirichlet, AMG", *am, ph,
+                o, false);
+    }
+    // periodic in x
+    auto pm = uniformMesh(8, true);
+    poisson::Problem pp;
+    pp.beta = jumpBeta(*pm, 1.0, 1000.0);
+    pp.rhs = rhsOf(*pm);
+    compare("uniform periodic-x, jump 1000", *pm, pp, poisson::Options(), true);
+    // maxIter exhaustion is reported
+    poisson::Options of;
+    of.gpu = true;
+    of.maxIter = 2;
+    of.tol = 1e-14;
+    std::vector<double> xf(am->nCells(), 0.0);
+    const poisson::Result rf = poisson::solve(*am, p, xf, of);
+    expect(!rf.converged && rf.iterations == 2 && rf.residual > 0, "GPU: non-convergence reported");
+    std::printf("  initial guess, non-leaf entries, failure reporting: checked\n");
+}
+
+void bench(bool gpu) {
+    std::printf("Benchmark on the %s (tol 1e-9, zero initial guess; times include setup):\n",
+                gpu ? ("GPU: " + poisson::gpuDevice()).c_str() : "CPU");
     std::printf("  %-22s %9s %-10s %5s %9s %9s %9s\n", "mesh", "leaves", "beta", "iter", "setup[s]", "total[s]",
                 "resid");
     std::vector<std::pair<std::string, std::function<std::unique_ptr<Mesh>()>>> meshes = {
@@ -409,6 +491,7 @@ void bench() {
             }
             std::vector<double> x(m->nCells(), 0.0);
             poisson::Options o;
+            o.gpu = gpu;
             const double t0 = now();
             poisson::Result r = poisson::solve(*m, p, x, o);
             const double t1 = now();
@@ -430,7 +513,12 @@ int main(int argc, char** argv) {
     const bool doBench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const double t0 = now();
     if (doBench) {
-        bench();
+        const bool gpu = argc > 2 && std::strcmp(argv[2], "--gpu") == 0;
+        if (gpu && poisson::gpuDevice().empty()) {
+            std::printf("no GPU solver (CPU-only build or no CUDA device)\n");
+            return 1;
+        }
+        bench(gpu);
         return 0;
     }
     testConvergence(false, true);
@@ -441,6 +529,7 @@ int main(int argc, char** argv) {
     testSymmetry();
     testHelmholtz();
     testMisc();
+    testGpu();
     std::printf("%s (%d failures, %.1f s)\n", fails ? "POISSON TEST FAILED" : "POISSON TEST PASSED", fails,
                 now() - t0);
     return fails != 0;

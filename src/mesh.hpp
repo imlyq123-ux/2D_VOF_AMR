@@ -80,6 +80,10 @@ public:
     double ymax() const { return cfg_.y0 + cfg_.ny0 * cfg_.L0; }
     bool periodicX() const { return cfg_.periodicX; }
     bool periodicY() const { return cfg_.periodicY; }
+    // Identifies the topology (cells, leaves, faces): unique among the meshes of the
+    // process and renewed whenever adapt() changes the mesh, so that other modules can
+    // cache data that depend on the topology only.
+    uint64_t revision() const { return revision_; }
 
     // ---------------------------------------------------------------- cells
     int nCells() const { return (int)lev_.size(); }
@@ -160,6 +164,7 @@ public:
 
 private:
     Config cfg_;
+    uint64_t revision_ = 0;
     std::vector<double> h_;
     // per-level dense maps (L, i, j) -> cell index or -1
     std::vector<std::vector<int>> map_;

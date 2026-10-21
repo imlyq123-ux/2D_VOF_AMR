@@ -31,6 +31,13 @@
 //     projected onto the range (Euclidean mean removed), the final solution is shifted
 //     to zero volume-weighted mean.
 //   * Everything is rebuilt on every call (setup ~ a few SpMV-equivalents per level).
+//   * Options::gpu (CUDA builds): the system and hierarchy are handed to the device solver
+//     (poisson_gpu.cu), which runs the same FCG/K-cycle iteration with a multicolour
+//     Gauss-Seidel smoother. Below level kGpuAggressive the hierarchy coarsens by triple
+//     pairwise aggregation (aggregates of <= 8): the K-cycle visits level l up to 2^l
+//     times, and on the GPU every visit of a small level costs a few microseconds of
+//     barrier latency whatever its size, so fewer levels pay off; the convergence is
+//     practically unchanged.
 #include "poisson.hpp"
 
 #include <algorithm>
@@ -38,6 +45,9 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#ifdef VOF2D_CUDA
+#include "poisson_gpu.hpp"
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #else
@@ -56,6 +66,8 @@ constexpr int kMaxLevels = 40;
 constexpr double kStrong = 0.25;    // strength of connection threshold
 constexpr double kDiagDom = 5.0;    // rows with a_ii >= kDiagDom sum|a_ij| are not coarsened
 constexpr double kKTol = 0.25;      // K-cycle: skip the 2nd inner iteration below this ratio
+constexpr int kGpuMin = 30000;      // Options::gpu: smaller systems are solved on the CPU
+constexpr int kGpuAggressive = 2;   // Options::gpu: levels >= this coarsen by aggregates of 8
 
 // Number of threads for a loop of length n: small levels use few threads (barrier cost,
 // robustness when the machine is oversubscribed).
@@ -309,11 +321,16 @@ struct Level {
 
 class Amg {
 public:
-    void setup(Csr&& A0, bool singular);
+    // Levels l >= aggressiveFrom are coarsened by three pairwise passes instead of two.
+    void setup(Csr&& A0, bool singular, int aggressiveFrom = kMaxLevels);
     void apply(const double* r, double* z) { cycle(0, r, z); }
     int nLevels() const { return (int)lv_.size(); }
     const Csr& matrix(int l) const { return lv_[l].A; }
+    const Level& level(int l) const { return lv_[l]; }
     bool denseCoarse() const { return dense_; }
+    // lower Cholesky factor of the coarsest matrix (row-major), null if not dense
+    const double* coarseFactor() const { return dense_ ? chol_.data() : nullptr; }
+    bool regularized() const { return regularized_; }
 
 private:
     std::vector<Level> lv_;
@@ -327,7 +344,7 @@ private:
     void factorCoarse();
 };
 
-void Amg::setup(Csr&& A0, bool singular) {
+void Amg::setup(Csr&& A0, bool singular, int aggressiveFrom) {
     singular_ = singular;
     lv_.clear();
     lv_.emplace_back();
@@ -338,17 +355,27 @@ void Amg::setup(Csr&& A0, bool singular) {
         L.res.assign(L.A.n, 0.0);
         L.e.assign(L.A.n, 0.0);
         if (L.A.n <= kCoarseMax || (int)lv_.size() >= kMaxLevels) break;
-        // double pairwise aggregation
+        // double (triple) pairwise aggregation
         std::vector<int> agg1, agg2, mp1, mm1, mp2, mm2;
         const int n1 = pairwise(L.A, agg1, true);
         if (n1 == 0) break;  // everything strongly diagonally dominant: smoother suffices
         members(agg1, n1, mp1, mm1);
         Csr A1;
         galerkin(L.A, agg1, n1, mp1, mm1, A1);
-        const int n2 = pairwise(A1, agg2, false);
+        int n2 = pairwise(A1, agg2, false);
         members(agg2, n2, mp2, mm2);
         Csr A2;
         galerkin(A1, agg2, n2, mp2, mm2, A2);
+        if ((int)lv_.size() - 1 >= aggressiveFrom) {
+            std::vector<int> agg3, mp3, mm3;
+            const int n3 = pairwise(A2, agg3, false);
+            members(agg3, n3, mp3, mm3);
+            Csr A3;
+            galerkin(A2, agg3, n3, mp3, mm3, A3);
+            for (int& a : agg2) a = agg3[a];
+            A2 = std::move(A3);
+            n2 = n3;
+        }
         if (n2 > 0.85 * L.A.n) break;  // coarsening stalled
         L.agg.resize(L.A.n);
         for (int i = 0; i < L.A.n; ++i) L.agg[i] = agg1[i] >= 0 ? agg2[agg1[i]] : -1;
@@ -532,9 +559,81 @@ void zOrder(const Mesh& m, std::vector<int>& order, std::vector<int>& rowOfLeaf)
         }
 }
 
+// Topology-only part of the operator, cached between solves on the same mesh (the
+// driver solves three systems per time step and regrids only every few steps): Z-order
+// rows, the sorted off-diagonal CSR pattern and, per row, its faces with the CSR
+// position they contribute to. Assembling the values is then a streaming pass.
+struct Pattern {
+    uint64_t revision = 0;       // Mesh::revision() it was built for
+    std::vector<int> order;      // row -> cell index (Z-order)
+    std::vector<int> rowOfLeaf;  // leaf ordinal -> row
+    std::vector<double> vol;     // V per row
+    std::vector<int> ptr, col;   // off-diagonal CSR (columns sorted)
+    std::vector<int> fptr;       // row -> its faces [fptr[k], fptr[k+1])
+    std::vector<int> face;       // Mesh face index
+    std::vector<int> slot;       // CSR position; -1: boundary face, -2: periodic self-face
+    std::vector<double> area, dist;
+};
+
+// Pattern of m, rebuilt when the mesh changed (poisson::solve is not reentrant).
+const Pattern& pattern(const Mesh& m) {
+    static Pattern P;
+    if (P.revision == m.revision()) return P;
+    P.revision = m.revision();
+    const int n = m.nLeaves();
+    zOrder(m, P.order, P.rowOfLeaf);
+    const auto& faces = m.faces();
+    P.vol.resize(n);
+    P.fptr.assign(n + 1, 0);
+    for (int k = 0; k < n; ++k) {
+        const int c = P.order[k];
+        P.vol[k] = m.volume(c);
+        P.fptr[k + 1] = P.fptr[k] + (int)(m.cellFacesEnd(c) - m.cellFacesBegin(c));
+    }
+    const int ne = P.fptr[n];
+    P.face.resize(ne);
+    P.slot.resize(ne);
+    P.area.resize(ne);
+    P.dist.resize(ne);
+    constexpr int W = 8;  // max off-diagonal entries per row (<= 8 faces by 2:1 balance)
+    std::vector<int> tc((size_t)W * n), cnt(n);
+#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+    for (int k = 0; k < n; ++k) {
+        const int c = P.order[k];
+        int* rc = &tc[(size_t)W * k];
+        int q = 0, e = P.fptr[k];
+        for (const int* f = m.cellFacesBegin(c); f != m.cellFacesEnd(c); ++f, ++e) {
+            const Mesh::Face& F = faces[*f];
+            const int nb = (F.L == c) ? F.R : F.L;
+            P.face[e] = *f;
+            P.area[e] = F.area;
+            P.dist[e] = F.dist;
+            if (nb < 0) { P.slot[e] = -1; continue; }
+            if (nb == c) { P.slot[e] = -2; continue; }  // single cell across a periodic domain
+            const int j = P.rowOfLeaf[m.leafIndex(nb)];
+            P.slot[e] = j;  // column for now
+            int t = 0;
+            while (t < q && rc[t] != j) ++t;
+            if (t == q) rc[q++] = j;
+        }
+        std::sort(rc, rc + q);
+        cnt[k] = q;
+    }
+    P.ptr.assign(n + 1, 0);
+    for (int k = 0; k < n; ++k) P.ptr[k + 1] = P.ptr[k] + cnt[k];
+    P.col.resize(P.ptr[n]);
+#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+    for (int k = 0; k < n; ++k) {
+        const int* rc = &tc[(size_t)W * k];
+        std::copy(rc, rc + cnt[k], P.col.begin() + P.ptr[k]);
+        for (int e = P.fptr[k]; e < P.fptr[k + 1]; ++e)
+            if (P.slot[e] >= 0) P.slot[e] = P.ptr[k] + (int)(std::find(rc, rc + cnt[k], P.slot[e]) - rc);
+    }
+    return P;
+}
+
 struct System {
-    std::vector<int> order;     // row -> cell index (Z-order)
-    std::vector<int> rowOfLeaf; // leaf ordinal -> row
+    const Pattern* pat = nullptr;
     Csr A;
     std::vector<double> b;      // integrated rhs (incl. Dirichlet contributions)
     std::vector<double> invV;   // 1 / V per row (norm weights)
@@ -542,79 +641,47 @@ struct System {
 };
 
 void assemble(const Mesh& m, const Problem& p, System& S) {
+    const Pattern& P = pattern(m);
+    S.pat = &P;
     const int n = m.nLeaves();
-    zOrder(m, S.order, S.rowOfLeaf);
-    const std::vector<int>& leaves = S.order;
-    const std::vector<int>& row = S.rowOfLeaf;
-    const auto& faces = m.faces();
-    constexpr int W = 8;  // max off-diagonal entries per row (<= 8 faces by 2:1 balance)
-    auto tcBuf = scratch<int>((size_t)W * n);
-    auto tvBuf = scratch<double>((size_t)W * n);
-    int* tc = tcBuf.get();
-    double* tv = tvBuf.get();
-    std::vector<int> cnt(n);
     Csr& A = S.A;
     A.n = n;
-    A.diag.assign(n, 0.0);
-    S.b.assign(n, 0.0);
-    S.invV.assign(n, 0.0);
+    A.ptr = P.ptr;
+    A.col = P.col;
+    A.val.assign(P.col.size(), 0.0);
+    A.diag.resize(n);
+    S.b.resize(n);
+    S.invV.resize(n);
     const bool hasLam = !p.lambda.empty();
     const bool hasDirArr = !p.dirichlet.empty();
     const bool hasBv = !p.bvalue.empty();
     int nDir = 0, nLam = 0;
 #pragma omp parallel for schedule(static) reduction(+ : nDir, nLam) num_threads(nthr(n)) if (n > kPar)
     for (int k = 0; k < n; ++k) {
-        const int c = leaves[k];
-        const double V = m.volume(c);
+        const int c = P.order[k];
+        const double V = P.vol[k];
         S.invV[k] = 1.0 / V;
         double d = 0.0;
         if (hasLam && p.lambda[c] != 0.0) { d = p.lambda[c] * V; ++nLam; }
         double b = p.rhs[c] * V;
-        int* rc = &tc[(size_t)W * k];
-        double* rv = &tv[(size_t)W * k];
-        int q = 0;
-        for (const int* f = m.cellFacesBegin(c); f != m.cellFacesEnd(c); ++f) {
-            const Mesh::Face& F = faces[*f];
-            const int nb = (F.L == c) ? F.R : F.L;
-            const double a = p.beta[*f] * F.area / F.dist;
-            if (nb < 0) {
-                if (hasDirArr && p.dirichlet[*f]) {
+        for (int e = P.fptr[k]; e < P.fptr[k + 1]; ++e) {
+            const int f = P.face[e], sl = P.slot[e];
+            const double a = p.beta[f] * P.area[e] / P.dist[e];
+            if (sl == -1) {
+                if (hasDirArr && p.dirichlet[f]) {
                     ++nDir;
                     d += a;
-                    if (hasBv) b += a * p.bvalue[*f];
+                    if (hasBv) b += a * p.bvalue[f];
                 }
                 continue;
             }
-            if (nb == c) continue;  // periodic self-face (single cell across the domain)
+            if (sl == -2) continue;
             d += a;
-            const int j = row[m.leafIndex(nb)];
-            int t = 0;
-            while (t < q && rc[t] != j) ++t;
-            if (t == q) { rc[q] = j; rv[q] = 0.0; ++q; }
-            rv[t] -= a;
-        }
-        for (int a = 1; a < q; ++a) {  // sort columns
-            const int cj = rc[a];
-            const double vj = rv[a];
-            int t = a - 1;
-            while (t >= 0 && rc[t] > cj) { rc[t + 1] = rc[t]; rv[t + 1] = rv[t]; --t; }
-            rc[t + 1] = cj;
-            rv[t + 1] = vj;
+            A.val[sl] -= a;
         }
         A.diag[k] = d;
         S.b[k] = b;
-        cnt[k] = q;
     }
-    A.ptr.assign(n + 1, 0);
-    for (int k = 0; k < n; ++k) A.ptr[k + 1] = A.ptr[k] + cnt[k];
-    A.col.resize(A.ptr[n]);
-    A.val.resize(A.ptr[n]);
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
-    for (int k = 0; k < n; ++k)
-        for (int q = 0; q < cnt[k]; ++q) {
-            A.col[A.ptr[k] + q] = tc[(size_t)W * k + q];
-            A.val[A.ptr[k] + q] = tv[(size_t)W * k + q];
-        }
     S.singular = (nDir == 0 && nLam == 0);
 }
 
@@ -627,7 +694,7 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
 
     System S;
     assemble(m, p, S);
-    const std::vector<int>& leaves = S.order;  // row -> cell
+    const std::vector<int>& leaves = S.pat->order;  // row -> cell
     const std::vector<double>& w = S.invV;
     std::vector<double>& B = S.b;
 
@@ -655,15 +722,19 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
         for (int k = 0; k < n; ++k) v[k] -= s;
     };
 
-    std::vector<double> xs(n), r(n), z(n), d(n), q(n);
+    std::vector<double> xs(n), r, z, d, q;  // CPU work vectors: sized below if used
     for (int k = 0; k < n; ++k) xs[k] = x[leaves[k]];
 
     // ---- preconditioner
     Amg amg;
     std::vector<double> jac;
     const bool useAmg = opt.precond != 0;
-    if (useAmg)
-        amg.setup(std::move(S.A), S.singular);  // the hierarchy owns the finest matrix
+    bool onGpu = false;
+#ifdef VOF2D_CUDA
+    onGpu = opt.gpu && n >= kGpuMin && gpu::available();
+#endif
+    if (useAmg)  // the hierarchy owns the finest matrix
+        amg.setup(std::move(S.A), S.singular, onGpu ? kGpuAggressive : kMaxLevels);
     else
         jac = invDiag(S.A);
     const Csr& A = useAmg ? amg.matrix(0) : S.A;
@@ -692,9 +763,51 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
     int it = 0;
     bool conv = false;
     double rn = 0.0;
+#ifdef VOF2D_CUDA
+    if (onGpu) {
+        const int nl = useAmg ? amg.nLevels() : 1;
+        std::vector<gpu::Level> gl(nl);
+        for (int l = 0; l < nl; ++l) {
+            const Csr& Al = useAmg ? amg.matrix(l) : A;
+            gpu::Level& g = gl[l];
+            g.n = Al.n;
+            g.ptr = Al.ptr.data();
+            g.col = Al.col.data();
+            g.val = Al.val.data();
+            g.diag = Al.diag.data();
+            if (l + 1 < nl) {
+                const Level& L = amg.level(l);
+                g.nNext = amg.matrix(l + 1).n;
+                g.agg = L.agg.data();
+                g.mptr = L.mptr.data();
+                g.mem = L.mem.data();
+            }
+        }
+        gpu::Problem gp;
+        gp.levels = gl.data();
+        gp.nLevels = nl;
+        gp.amg = useAmg;
+        gp.chol = useAmg ? amg.coarseFactor() : nullptr;
+        gp.regularized = useAmg && amg.regularized();
+        gp.singular = S.singular;
+        gp.b = B.data();
+        gp.w = w.data();
+        gp.x = xs.data();
+        gp.tol = opt.tol;
+        gp.absTol = opt.absTol;
+        gp.maxIter = opt.maxIter;
+        const gpu::Outcome o = gpu::solve(gp);
+        onGpu = o.ran;
+        it = o.iterations;
+        rn = o.rnorm;
+        conv = o.converged;
+    }
+#endif
+    if (!onGpu)
+        for (auto* v : {&r, &z, &d, &q}) v->resize(n);
     // FCG; restarted from the true residual (at most 3 times) if the recursively updated
     // residual met the tolerance but the true one does not.
-    for (int pass = 0;; ++pass) {
+    for (int pass = 0; !onGpu; ++pass) {
         rn = trueResidual();
         if (done(rn)) { conv = true; break; }
         if (pass == 3 || it >= opt.maxIter) break;
@@ -740,8 +853,8 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
     res.residual = bn > 0.0 ? rn / bn : rn;
     res.converged = conv;
     if (opt.verbose) {
-        std::printf("poisson: n=%d %s levels=%d singular=%d setup %.3fs solve %.3fs it=%d res=%.3e %s\n", n,
-                    useAmg ? "AMG" : "Jacobi", useAmg ? amg.nLevels() : 1, (int)S.singular, t1 - t0,
+        std::printf("poisson: n=%d %s%s levels=%d singular=%d setup %.3fs solve %.3fs it=%d res=%.3e %s\n", n,
+                    useAmg ? "AMG" : "Jacobi", onGpu ? " (GPU)" : "", useAmg ? amg.nLevels() : 1, (int)S.singular, t1 - t0,
                     now() - t1, it, res.residual, res.converged ? "" : "NOT CONVERGED");
         if (useAmg) {
             size_t tot = 0;
@@ -754,6 +867,14 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
         }
     }
     return res;
+}
+
+std::string gpuDevice() {
+#ifdef VOF2D_CUDA
+    return gpu::deviceName();
+#else
+    return "";
+#endif
 }
 
 }  // namespace poisson
