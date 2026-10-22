@@ -221,14 +221,14 @@ python3 scripts/make_video.py output/video_rayleigh_taylor --height 10 --dpi 100
 [![breaking wave](docs/media/breaking_wave.gif)](docs/media/breaking_wave.mp4)
 
 A steep Stokes wave (ε = 0.55, Re = 40000, Bo = 1000, density ratio 850) overturns, plunges,
-traps air and breaks up over 4 wave periods (levels 4–9, momentum-conserving advection).
-The top-right panel compares the energy budget with the literature: 84 % of the wave energy
-dissipated after 4 periods vs ≈ 70 % in Deike et al. (Chen et al. 1999: ≈ 80 %, Iafrati
-2011: ≈ 60 %).
+traps air and breaks up over 4 wave periods (levels 8–10, the resolution of Deike et al.;
+momentum-conserving advection; 34,551 steps, 53 min on 8 cores). The top-right panel
+compares the energy budget with the literature: 77 % of the wave energy dissipated after 4
+periods vs ≈ 70 % in Deike et al. (Chen et al. 1999: ≈ 80 %, Iafrati 2011: ≈ 60 %).
 
 ```bash
-./bin/vof2d cases/breaking_wave.cfg outDir=output/breaking_wave_deike2015
-python3 scripts/make_video.py output/breaking_wave_deike2015 --wave-energy --fps 20 --dpi 100 --arrows 16 --arrow-umax 1.0
+OMP_NUM_THREADS=8 ./bin/vof2d cases/breaking_wave.cfg minLevel=8 maxLevel=10 outDir=output/breaking_wave_L10
+python3 scripts/make_video.py output/breaking_wave_L10 --wave-energy --fps 20 --dpi 100 --arrows 16 --arrow-umax 1.0
 ```
 
 ## Validation (results from this code)
@@ -258,10 +258,11 @@ Unit tests (`make check`):
 * Oscillating drop (mode 2, ε = 0.1, R/h = 25.6): period 0.2350 vs 0.2306 from linear
   theory, damping rate 0.209 vs ≈ 0.20.
 * Breaking wave (Deike, Popinet & Melville, JFM 769, 2015: eps = 0.55, Re = 40000,
-  Bo = 1000; level 9, 11 min): 84% of the wave energy dissipated after 4 periods vs ≈70%
-  in the paper (Chen et al. 1999 ≈80%, Iafrati 2011 ≈60%); breaking-stage decay rate
-  0.27 vs 0.22; breaking starts at t/T ≈ 0.6 vs ≈ 1. The paper used level 10 and a vortex
-  sheet in the air at t = 0 (here: air at rest). `make_video.py --wave-energy` plots it.
+  Bo = 1000): energy dissipated after 4 periods 77% at levels 8–10 (53 min) and 84% at
+  levels 4–9 (11 min), vs ≈70% in the paper (Chen et al. 1999 ≈80%, Iafrati 2011 ≈60%);
+  breaking-stage decay rate 0.23 (level 10) and 0.27 (level 9) vs 0.22; breaking starts
+  at t/T ≈ 0.6 vs ≈ 1. The paper used level 10 and a vortex sheet in the air at t = 0
+  (here: air at rest). `make_video.py --wave-energy` plots it.
 * Hydrostatics, density ratio 1000 on AMR with regridding: |u| ≤ 1e-11.
 * Taylor–Green vortex: 2nd order (uniform and AMR); lid-driven cavity Re=100 within
   0.005 of Ghia et al.
