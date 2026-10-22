@@ -20,9 +20,13 @@ Shared types: `src/common.hpp` (Vec2, Side), `src/params.hpp` (Params, BCs),
 
 ## Mesh in one paragraph
 
-Cell-based quadtree with per-level dense index maps → O(1) neighbour lookup
+Cell-based quadtree with per-level index maps → O(1) neighbour lookup. Levels with more
+than 2^20 index positions are tiled (16×16 tiles allocated where cells exist, found
+through a small dense directory), so memory and regrid time follow the number of cells,
+not 4^maxLevel; smaller levels are plain dense arrays
 (`Mesh::locate(L,i,j)` returns the cell (L,i,j) or the coarser leaf covering it,
-mirroring out-of-domain indices at non-periodic walls). Fields are
+mirroring out-of-domain indices at non-periodic walls). Cells are stored level by level,
+row-major within a level. Fields are
 `std::vector<double>` over all cells (leaves + ancestors); leaf values are the solution,
 parents are averages after `restrict()`. The tree is 2:1 balanced including corners.
 `faces()` is the list of leaf faces (coarse/fine faces have the fine size, so a coarse
@@ -79,11 +83,28 @@ the predicted velocity there was tried and makes static-drop spurious currents g
 * elsewhere, a wavelet estimate of u, v (difference between the leaf values and the
   prolongation from the parent) refines above `uTol` and coarsens below `uTol/1.5`.
 
+## Performance rules (OpenMP)
+
+* Never vary the team size (`num_threads(...)`) between parallel regions: libgomp then
+  destroys and re-creates its worker threads (~0.2 ms per region instead of ~1 µs). Run
+  small loops serially with an `if (n > threshold)` clause instead.
+* Do not allocate field-sized arrays per call in the time step: `std::vector(n, 0)` /
+  `assign` zero-fill on one thread while the others wait. Hot paths keep `static` work
+  buffers (`resize` is free when the size is unchanged) and write every entry they use
+  in a parallel loop. `main()` also sets glibc's `mallopt` thresholds so that freed
+  memory stays in the heap (otherwise every large allocation is a fresh mmap and pays
+  page faults on first touch).
+* Use the physical core count: on SMT machines `OMP_NUM_THREADS` = cores is faster than
+  all hardware threads (the K-cycle runs thousands of short parallel regions per solve,
+  and one descheduled thread stalls each barrier).
+* `run()` prints the wall time per step of each phase and the linear-solver setup /
+  iteration split at the end of a run; use it to check where time goes.
+
 ## GPU linear solver (src/poisson_gpu.cu, `make CUDA=1`)
 
 `poisson::solve` assembles the system (the matrix pattern is cached per
 `Mesh::revision()`) and builds the AMG hierarchy on the host. With `Options::gpu`
-(`Params::gpu`) and at least `kGpuMin` unknowns it hands the hierarchy to
+(`Params::gpu`) and at least `Options::gpuMin` unknowns it hands the hierarchy to
 `poisson::gpu::solve`, which
 
 * colours every level greedily and renumbers its rows colour by colour (each colour of

@@ -30,7 +30,9 @@
 //   * Singular case: b's volume-weighted mean is removed, the preconditioned residual is
 //     projected onto the range (Euclidean mean removed), the final solution is shifted
 //     to zero volume-weighted mean.
-//   * Everything is rebuilt on every call (setup ~ a few SpMV-equivalents per level).
+//   * The matrix values and the hierarchy are rebuilt on every call (setup ~ a few
+//     SpMV-equivalents per level); the storage is kept between calls, and the matrix
+//     pattern is cached per mesh revision.
 //   * Options::gpu (CUDA builds): the system and hierarchy are handed to the device solver
 //     (poisson_gpu.cu), which runs the same FCG/K-cycle iteration with a multicolour
 //     Gauss-Seidel smoother. Below level kGpuAggressive the hierarchy coarsens by triple
@@ -58,34 +60,22 @@ namespace poisson {
 namespace {
 
 constexpr int kPar = 8192;          // minimum vector length for OpenMP loops
-constexpr int kPerThread = 32768;   // rows per thread (few threads on small levels)
-constexpr int kBlock = 4096;        // hybrid Gauss-Seidel block size
+constexpr int kBlock = 1024;        // hybrid Gauss-Seidel block size
 constexpr int kCoarseMax = 100;     // stop coarsening at this size
 constexpr int kDenseMax = 800;      // dense Cholesky on the coarsest level up to this size
 constexpr int kMaxLevels = 40;
 constexpr double kStrong = 0.25;    // strength of connection threshold
 constexpr double kDiagDom = 5.0;    // rows with a_ii >= kDiagDom sum|a_ij| are not coarsened
 constexpr double kKTol = 0.25;      // K-cycle: skip the 2nd inner iteration below this ratio
-constexpr int kGpuMin = 30000;      // Options::gpu: smaller systems are solved on the CPU
 constexpr int kGpuAggressive = 2;   // Options::gpu: levels >= this coarsen by aggregates of 8
-
-// Number of threads for a loop of length n: small levels use few threads (barrier cost,
-// robustness when the machine is oversubscribed).
-inline int nthr(long n) {
-#ifdef _OPENMP
-    const long t = std::min<long>(omp_get_max_threads(), std::max<long>(1, n / kPerThread));
-    return (int)t;
-#else
-    (void)n;
-    return 1;
-#endif
-}
 
 // Uninitialized scratch array (avoids zero-filling large temporaries).
 template <class T>
 std::unique_ptr<T[]> scratch(size_t n) {
     return std::unique_ptr<T[]>(new T[n]);
 }
+
+Timing gTiming;  // accumulated by solve()
 
 double now() {
     using namespace std::chrono;
@@ -107,12 +97,32 @@ void spmv(const Csr& A, const double* x, double* y) {
     const int* col = A.col.data();
     const double* val = A.val.data();
     const double* dg = A.diag.data();
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int i = 0; i < n; ++i) {
         double s = dg[i] * x[i];
         for (int k = ptr[i]; k < ptr[i + 1]; ++k) s += val[k] * x[col[k]];
         y[i] = s;
     }
+}
+
+// q = A d, and the products d.q and d.r in the same pass.
+void spmvDots(const Csr& A, const double* d, const double* r, double* q, double& dq, double& dr) {
+    const int n = A.n;
+    const int* ptr = A.ptr.data();
+    const int* col = A.col.data();
+    const double* val = A.val.data();
+    const double* dg = A.diag.data();
+    double sq = 0.0, sr = 0.0;
+#pragma omp parallel for schedule(static) reduction(+ : sq, sr) if (n > kPar)
+    for (int i = 0; i < n; ++i) {
+        double s = dg[i] * d[i];
+        for (int k = ptr[i]; k < ptr[i + 1]; ++k) s += val[k] * d[col[k]];
+        q[i] = s;
+        sq += d[i] * s;
+        sr += d[i] * r[i];
+    }
+    dq = sq;
+    dr = sr;
 }
 
 // r = b - A x
@@ -122,7 +132,7 @@ void residual(const Csr& A, const double* b, const double* x, double* r) {
     const int* col = A.col.data();
     const double* val = A.val.data();
     const double* dg = A.diag.data();
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int i = 0; i < n; ++i) {
         double s = b[i] - dg[i] * x[i];
         for (int k = ptr[i]; k < ptr[i + 1]; ++k) s -= val[k] * x[col[k]];
@@ -132,7 +142,7 @@ void residual(const Csr& A, const double* b, const double* x, double* r) {
 
 double dot(const double* a, const double* b, int n) {
     double s = 0.0;
-#pragma omp parallel for reduction(+ : s) schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for simd reduction(+ : s) schedule(static) if (n > kPar)
     for (int i = 0; i < n; ++i) s += a[i] * b[i];
     return s;
 }
@@ -143,7 +153,7 @@ void gsForward(const Csr& A, const double* invd, const double* r, double* z) {
     const int* ptr = A.ptr.data();
     const int* col = A.col.data();
     const double* val = A.val.data();
-#pragma omp parallel for schedule(static) num_threads(std::min(nb, nthr((long)n))) if (nb > 1)
+#pragma omp parallel for schedule(static) if (nb > 1)
     for (int b = 0; b < nb; ++b) {
         const int lo = b * kBlock, hi = std::min(n, lo + kBlock);
         for (int i = lo; i < hi; ++i) {
@@ -157,24 +167,37 @@ void gsForward(const Csr& A, const double* invd, const double* r, double* z) {
     }
 }
 
-// z += backward hybrid GS sweep for A e = r starting from e = 0 (e: work array).
-void gsBackwardAdd(const Csr& A, const double* invd, const double* r, double* e, double* z) {
+// z += backward hybrid GS sweep for A e = r - A z starting from e = 0 (res, e: work
+// arrays). Each block computes the residual of its rows right before sweeping them, so
+// the rows are read from memory once; z is updated only after all residuals are known.
+void residualGsBackwardAdd(const Csr& A, const double* invd, const double* r, double* res, double* e,
+                           double* z) {
     const int n = A.n, nb = (n + kBlock - 1) / kBlock;
     const int* ptr = A.ptr.data();
     const int* col = A.col.data();
     const double* val = A.val.data();
-#pragma omp parallel for schedule(static) num_threads(std::min(nb, nthr((long)n))) if (nb > 1)
-    for (int b = 0; b < nb; ++b) {
-        const int lo = b * kBlock, hi = std::min(n, lo + kBlock);
-        for (int i = hi - 1; i >= lo; --i) {
-            double s = r[i];
-            for (int k = ptr[i]; k < ptr[i + 1]; ++k) {
-                const int j = col[k];
-                if (j > i && j < hi) s -= val[k] * e[j];
+    const double* dg = A.diag.data();
+#pragma omp parallel if (nb > 1)
+    {
+#pragma omp for schedule(static)
+        for (int b = 0; b < nb; ++b) {
+            const int lo = b * kBlock, hi = std::min(n, lo + kBlock);
+            for (int i = lo; i < hi; ++i) {
+                double s = r[i] - dg[i] * z[i];
+                for (int k = ptr[i]; k < ptr[i + 1]; ++k) s -= val[k] * z[col[k]];
+                res[i] = s;
             }
-            e[i] = s * invd[i];
+            for (int i = hi - 1; i >= lo; --i) {
+                double s = res[i];
+                for (int k = ptr[i]; k < ptr[i + 1]; ++k) {
+                    const int j = col[k];
+                    if (j > i && j < hi) s -= val[k] * e[j];
+                }
+                e[i] = s * invd[i];
+            }
         }
-        for (int i = lo; i < hi; ++i) z[i] += e[i];
+#pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) z[i] += e[i];
     }
 }
 
@@ -188,7 +211,7 @@ void restrictResidual(const Csr& A, const std::vector<int>& mptr, const std::vec
     const double* dg = A.diag.data();
     const int* mp = mptr.data();
     const int* mm = mem.data();
-#pragma omp parallel for schedule(static) num_threads(nthr(4L * nc)) if (nc > kPar / 4)
+#pragma omp parallel for schedule(static) if (nc > kPar / 4)
     for (int I = 0; I < nc; ++I) {
         double s = 0.0;
         for (int q = mp[I]; q < mp[I + 1]; ++q) {
@@ -206,7 +229,7 @@ int pairwise(const Csr& A, std::vector<int>& agg, bool excludeDD) {
     const int n = A.n;
     agg.assign(n, -2);
     std::vector<double> thr(n);
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int i = 0; i < n; ++i) {
         double mx = 0.0, off = 0.0;
         for (int k = A.ptr[i]; k < A.ptr[i + 1]; ++k) {
@@ -246,7 +269,7 @@ void members(const std::vector<int>& agg, int nc, std::vector<int>& mptr, std::v
 void galerkin(const Csr& A, const std::vector<int>& agg, int nc, const std::vector<int>& mptr,
               const std::vector<int>& mem, Csr& Ac) {
     std::vector<int> ub(nc + 1, 0);
-#pragma omp parallel for schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for schedule(static) if (nc > kPar)
     for (int I = 0; I < nc; ++I) {
         int s = 0;
         for (int q = mptr[I]; q < mptr[I + 1]; ++q) s += A.ptr[mem[q] + 1] - A.ptr[mem[q]];
@@ -260,7 +283,7 @@ void galerkin(const Csr& A, const std::vector<int>& agg, int nc, const std::vect
     double* tval = tvalBuf.get();
     Ac.n = nc;
     Ac.diag.assign(nc, 0.0);
-#pragma omp parallel for schedule(static) num_threads(nthr(nc)) if (nc > kPar / 4)
+#pragma omp parallel for schedule(static) if (nc > kPar / 4)
     for (int I = 0; I < nc; ++I) {
         const int base = ub[I];
         int c = 0;
@@ -294,23 +317,23 @@ void galerkin(const Csr& A, const std::vector<int>& agg, int nc, const std::vect
     for (int I = 0; I < nc; ++I) Ac.ptr[I + 1] = Ac.ptr[I] + cnt[I];
     Ac.col.resize(Ac.ptr[nc]);
     Ac.val.resize(Ac.ptr[nc]);
-#pragma omp parallel for schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for schedule(static) if (nc > kPar)
     for (int I = 0; I < nc; ++I) {
         std::copy(tcol + ub[I], tcol + ub[I] + cnt[I], Ac.col.begin() + Ac.ptr[I]);
         std::copy(tval + ub[I], tval + ub[I] + cnt[I], Ac.val.begin() + Ac.ptr[I]);
     }
 }
 
-std::vector<double> invDiag(const Csr& A) {
-    std::vector<double> d(A.n);
+void invDiag(const Csr& A, std::vector<double>& d) {
+    d.resize(A.n);
+#pragma omp parallel for schedule(static) if (A.n > kPar)
     for (int i = 0; i < A.n; ++i) d[i] = A.diag[i] > 0.0 ? 1.0 / A.diag[i] : 0.0;
-    return d;
 }
 
 // ------------------------------------------------------------------ AMG hierarchy
 
 struct Level {
-    Csr A;
+    Csr A;                       // coarse levels only (level 0: the system matrix)
     std::vector<double> invd;
     std::vector<int> agg;        // row -> next-level aggregate (-1: not in coarse space)
     std::vector<int> mptr, mem;  // next-level aggregate -> rows
@@ -319,13 +342,16 @@ struct Level {
     std::vector<double> rc, ec, v1, w1, v2, w2, tc;
 };
 
+// The hierarchy keeps its storage between setups (solve() reuses one instance), so that
+// the per-level work vectors are not reallocated and zero-filled on every solve.
 class Amg {
 public:
-    // Levels l >= aggressiveFrom are coarsened by three pairwise passes instead of two.
-    void setup(Csr&& A0, bool singular, int aggressiveFrom = kMaxLevels);
+    // A0 must outlive the use of the hierarchy. Levels l >= aggressiveFrom are coarsened
+    // by three pairwise passes instead of two.
+    void setup(const Csr& A0, bool singular, int aggressiveFrom = kMaxLevels);
     void apply(const double* r, double* z) { cycle(0, r, z); }
-    int nLevels() const { return (int)lv_.size(); }
-    const Csr& matrix(int l) const { return lv_[l].A; }
+    int nLevels() const { return nl_; }
+    const Csr& matrix(int l) const { return l == 0 ? *a0_ : lv_[l].A; }
     const Level& level(int l) const { return lv_[l]; }
     bool denseCoarse() const { return dense_; }
     // lower Cholesky factor of the coarsest matrix (row-major), null if not dense
@@ -333,40 +359,46 @@ public:
     bool regularized() const { return regularized_; }
 
 private:
-    std::vector<Level> lv_;
+    std::vector<Level> lv_;      // lv_[0 .. nl_ - 1] in use
+    int nl_ = 0;
+    const Csr* a0_ = nullptr;
     bool singular_ = false;
     bool dense_ = false;
     bool regularized_ = false;
     std::vector<double> chol_;   // dense lower Cholesky factor of the coarsest matrix
+    std::vector<double> cholT_;  // its transpose (row-major upper factor: contiguous rows
+                                 // for the backward substitution)
 
     void cycle(int l, const double* r, double* z);
     void coarseSolve(const double* r, double* z);
     void factorCoarse();
 };
 
-void Amg::setup(Csr&& A0, bool singular, int aggressiveFrom) {
+void Amg::setup(const Csr& A0, bool singular, int aggressiveFrom) {
     singular_ = singular;
-    lv_.clear();
-    lv_.emplace_back();
-    lv_[0].A = std::move(A0);
+    a0_ = &A0;
+    nl_ = 1;
+    if (lv_.empty()) lv_.emplace_back();
     for (;;) {
-        Level& L = lv_.back();
-        L.invd = invDiag(L.A);
-        L.res.assign(L.A.n, 0.0);
-        L.e.assign(L.A.n, 0.0);
-        if (L.A.n <= kCoarseMax || (int)lv_.size() >= kMaxLevels) break;
+        const int l = nl_ - 1;
+        Level& L = lv_[l];
+        const Csr& A = matrix(l);
+        invDiag(A, L.invd);
+        L.res.resize(A.n);  // work vectors: written before they are read
+        L.e.resize(A.n);
+        if (A.n <= kCoarseMax || nl_ >= kMaxLevels) break;
         // double (triple) pairwise aggregation
         std::vector<int> agg1, agg2, mp1, mm1, mp2, mm2;
-        const int n1 = pairwise(L.A, agg1, true);
+        const int n1 = pairwise(A, agg1, true);
         if (n1 == 0) break;  // everything strongly diagonally dominant: smoother suffices
         members(agg1, n1, mp1, mm1);
         Csr A1;
-        galerkin(L.A, agg1, n1, mp1, mm1, A1);
+        galerkin(A, agg1, n1, mp1, mm1, A1);
         int n2 = pairwise(A1, agg2, false);
         members(agg2, n2, mp2, mm2);
         Csr A2;
         galerkin(A1, agg2, n2, mp2, mm2, A2);
-        if ((int)lv_.size() - 1 >= aggressiveFrom) {
+        if (l >= aggressiveFrom) {
             std::vector<int> agg3, mp3, mm3;
             const int n3 = pairwise(A2, agg3, false);
             members(agg3, n3, mp3, mm3);
@@ -376,21 +408,23 @@ void Amg::setup(Csr&& A0, bool singular, int aggressiveFrom) {
             A2 = std::move(A3);
             n2 = n3;
         }
-        if (n2 > 0.85 * L.A.n) break;  // coarsening stalled
-        L.agg.resize(L.A.n);
-        for (int i = 0; i < L.A.n; ++i) L.agg[i] = agg1[i] >= 0 ? agg2[agg1[i]] : -1;
+        if (n2 > 0.85 * A.n) break;  // coarsening stalled
+        L.agg.resize(A.n);
+#pragma omp parallel for schedule(static) if (A.n > kPar)
+        for (int i = 0; i < A.n; ++i) L.agg[i] = agg1[i] >= 0 ? agg2[agg1[i]] : -1;
         members(L.agg, n2, L.mptr, L.mem);
-        for (auto* v : {&L.rc, &L.ec, &L.v1, &L.w1, &L.v2, &L.w2, &L.tc}) v->assign(n2, 0.0);
-        lv_.emplace_back();
-        lv_.back().A = std::move(A2);
+        for (auto* v : {&L.rc, &L.ec, &L.v1, &L.w1, &L.v2, &L.w2, &L.tc}) v->resize(n2);
+        if ((int)lv_.size() == nl_) lv_.emplace_back();  // (invalidates L and A)
+        lv_[nl_].A = std::move(A2);
+        ++nl_;
     }
     // the last level must not keep a coarse map
-    lv_.back().agg.clear();
+    lv_[nl_ - 1].agg.clear();
     factorCoarse();
 }
 
 void Amg::factorCoarse() {
-    const Csr& A = lv_.back().A;
+    const Csr& A = matrix(nl_ - 1);
     const int n = A.n;
     dense_ = n <= kDenseMax;
     regularized_ = false;
@@ -412,6 +446,7 @@ void Amg::factorCoarse() {
         for (int j = 0; j < n && ok; ++j) {
             double* Lj = &chol_[(size_t)j * n];
             double d = Lj[j];
+#pragma omp simd reduction(- : d)
             for (int k = 0; k < j; ++k) d -= Lj[k] * Lj[k];
             if (!(d > 1e-13 * std::max(A.diag[j], 1e-300))) { ok = false; break; }
             d = std::sqrt(d);
@@ -419,19 +454,27 @@ void Amg::factorCoarse() {
             for (int i = j + 1; i < n; ++i) {
                 double* Li = &chol_[(size_t)i * n];
                 double v = Li[j];
+#pragma omp simd reduction(- : v)
                 for (int k = 0; k < j; ++k) v -= Li[k] * Lj[k];
                 Li[j] = v / d;
             }
         }
-        if (ok) { regularized_ = reg; return; }
+        if (ok) {
+            regularized_ = reg;
+            cholT_.assign((size_t)n * n, 0.0);
+            for (int i = 0; i < n; ++i)
+                for (int k = 0; k <= i; ++k) cholT_[(size_t)k * n + i] = chol_[(size_t)i * n + k];
+            return;
+        }
         if (reg) break;
     }
     dense_ = false;  // fall back to smoothing on the coarsest level
 }
 
 void Amg::coarseSolve(const double* r, double* z) {
-    Level& L = lv_.back();
-    const int n = L.A.n;
+    Level& L = lv_[nl_ - 1];
+    const Csr& A = matrix(nl_ - 1);
+    const int n = A.n;
     if (dense_) {
         double mean = 0.0;
         if (regularized_) {
@@ -441,40 +484,38 @@ void Amg::coarseSolve(const double* r, double* z) {
         for (int i = 0; i < n; ++i) {
             const double* Li = &chol_[(size_t)i * n];
             double v = r[i] - mean;
+#pragma omp simd reduction(- : v)
             for (int k = 0; k < i; ++k) v -= Li[k] * z[k];
             z[i] = v / Li[i];
         }
         for (int i = n - 1; i >= 0; --i) {
+            const double* Ui = &cholT_[(size_t)i * n];
             double v = z[i];
-            for (int k = i + 1; k < n; ++k) v -= chol_[(size_t)k * n + i] * z[k];
-            z[i] = v / chol_[(size_t)i * n + i];
+#pragma omp simd reduction(- : v)
+            for (int k = i + 1; k < n; ++k) v -= Ui[k] * z[k];
+            z[i] = v / Ui[i];
         }
         return;
     }
     // large coarsest level (strongly diagonally dominant or stalled coarsening):
     // a few symmetric hybrid GS sweeps
-    gsForward(L.A, L.invd.data(), r, z);
-    for (int s = 0; s < 3; ++s) {
-        residual(L.A, r, z, L.res.data());
-        gsBackwardAdd(L.A, L.invd.data(), L.res.data(), L.e.data(), z);
-        residual(L.A, r, z, L.res.data());
-        gsBackwardAdd(L.A, L.invd.data(), L.res.data(), L.e.data(), z);
-    }
+    gsForward(A, L.invd.data(), r, z);
+    for (int s = 0; s < 6; ++s) residualGsBackwardAdd(A, L.invd.data(), r, L.res.data(), L.e.data(), z);
 }
 
 void Amg::cycle(int l, const double* r, double* z) {
-    if (l + 1 == (int)lv_.size()) { coarseSolve(r, z); return; }
+    if (l + 1 == nl_) { coarseSolve(r, z); return; }
     Level& L = lv_[l];
-    const Csr& A = L.A;
+    const Csr& A = matrix(l);
     const int n = A.n;
-    const Csr& Ac = lv_[l + 1].A;
+    const Csr& Ac = matrix(l + 1);
     const int nc = Ac.n;
     double* res = L.res.data();
     gsForward(A, L.invd.data(), r, z);
     double* rc = L.rc.data();
     double* ec = L.ec.data();
     restrictResidual(A, L.mptr, L.mem, r, z, rc);
-    if (l + 2 == (int)lv_.size()) {
+    if (l + 2 == nl_) {
         coarseSolve(rc, ec);
     } else {
         // K-cycle: two FCG iterations on the next level
@@ -483,7 +524,7 @@ void Amg::cycle(int l, const double* r, double* z) {
         cycle(l + 1, rc, v1);
         spmv(Ac, v1, w1);
         double rho1 = 0.0, a1 = 0.0;
-#pragma omp parallel for reduction(+ : rho1, a1) schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for reduction(+ : rho1, a1) schedule(static) if (nc > kPar)
         for (int I = 0; I < nc; ++I) { rho1 += v1[I] * w1[I]; a1 += v1[I] * rc[I]; }
         if (!(rho1 > 0.0)) {
             std::fill(ec, ec + nc, 0.0);
@@ -491,14 +532,14 @@ void Amg::cycle(int l, const double* r, double* z) {
             const double al = a1 / rho1;
             double* tc = L.tc.data();
             double rn = 0.0, tn = 0.0;
-#pragma omp parallel for reduction(+ : rn, tn) schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for reduction(+ : rn, tn) schedule(static) if (nc > kPar)
             for (int I = 0; I < nc; ++I) {
                 tc[I] = rc[I] - al * w1[I];
                 rn += rc[I] * rc[I];
                 tn += tc[I] * tc[I];
             }
             if (tn <= kKTol * kKTol * rn) {
-#pragma omp parallel for schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for schedule(static) if (nc > kPar)
                 for (int I = 0; I < nc; ++I) ec[I] = al * v1[I];
             } else {
                 double* v2 = L.v2.data();
@@ -506,7 +547,7 @@ void Amg::cycle(int l, const double* r, double* z) {
                 cycle(l + 1, tc, v2);
                 spmv(Ac, v2, w2);
                 double gam = 0.0, bet = 0.0, a2 = 0.0;
-#pragma omp parallel for reduction(+ : gam, bet, a2) schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for reduction(+ : gam, bet, a2) schedule(static) if (nc > kPar)
                 for (int I = 0; I < nc; ++I) {
                     gam += v2[I] * w1[I];
                     bet += v2[I] * w2[I];
@@ -515,19 +556,18 @@ void Amg::cycle(int l, const double* r, double* z) {
                 const double rho2 = bet - gam * gam / rho1;
                 const double c1 = rho2 > 0.0 ? al - gam * a2 / (rho1 * rho2) : al;
                 const double c2 = rho2 > 0.0 ? a2 / rho2 : 0.0;
-#pragma omp parallel for schedule(static) num_threads(nthr(nc)) if (nc > kPar)
+#pragma omp parallel for schedule(static) if (nc > kPar)
                 for (int I = 0; I < nc; ++I) ec[I] = c1 * v1[I] + c2 * v2[I];
             }
         }
     }
     {
         const int* agg = L.agg.data();
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
         for (int i = 0; i < n; ++i)
             if (agg[i] >= 0) z[i] += ec[agg[i]];
     }
-    residual(A, r, z, res);
-    gsBackwardAdd(A, L.invd.data(), res, L.e.data(), z);
+    residualGsBackwardAdd(A, L.invd.data(), r, res, L.e.data(), z);
 }
 
 // ------------------------------------------------------------------ assembly
@@ -597,7 +637,7 @@ const Pattern& pattern(const Mesh& m) {
     P.dist.resize(ne);
     constexpr int W = 8;  // max off-diagonal entries per row (<= 8 faces by 2:1 balance)
     std::vector<int> tc((size_t)W * n), cnt(n);
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int k = 0; k < n; ++k) {
         const int c = P.order[k];
         int* rc = &tc[(size_t)W * k];
@@ -622,7 +662,7 @@ const Pattern& pattern(const Mesh& m) {
     P.ptr.assign(n + 1, 0);
     for (int k = 0; k < n; ++k) P.ptr[k + 1] = P.ptr[k] + cnt[k];
     P.col.resize(P.ptr[n]);
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int k = 0; k < n; ++k) {
         const int* rc = &tc[(size_t)W * k];
         std::copy(rc, rc + cnt[k], P.col.begin() + P.ptr[k]);
@@ -634,6 +674,7 @@ const Pattern& pattern(const Mesh& m) {
 
 struct System {
     const Pattern* pat = nullptr;
+    uint64_t revision = 0;      // pattern revision of A.ptr / A.col
     Csr A;
     std::vector<double> b;      // integrated rhs (incl. Dirichlet contributions)
     std::vector<double> invV;   // 1 / V per row (norm weights)
@@ -646,9 +687,12 @@ void assemble(const Mesh& m, const Problem& p, System& S) {
     const int n = m.nLeaves();
     Csr& A = S.A;
     A.n = n;
-    A.ptr = P.ptr;
-    A.col = P.col;
-    A.val.assign(P.col.size(), 0.0);
+    if (S.revision != P.revision) {
+        A.ptr = P.ptr;
+        A.col = P.col;
+        S.revision = P.revision;
+    }
+    A.val.resize(P.col.size());
     A.diag.resize(n);
     S.b.resize(n);
     S.invV.resize(n);
@@ -656,7 +700,7 @@ void assemble(const Mesh& m, const Problem& p, System& S) {
     const bool hasDirArr = !p.dirichlet.empty();
     const bool hasBv = !p.bvalue.empty();
     int nDir = 0, nLam = 0;
-#pragma omp parallel for schedule(static) reduction(+ : nDir, nLam) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) reduction(+ : nDir, nLam) if (n > kPar)
     for (int k = 0; k < n; ++k) {
         const int c = P.order[k];
         const double V = P.vol[k];
@@ -664,6 +708,7 @@ void assemble(const Mesh& m, const Problem& p, System& S) {
         double d = 0.0;
         if (hasLam && p.lambda[c] != 0.0) { d = p.lambda[c] * V; ++nLam; }
         double b = p.rhs[c] * V;
+        for (int q = A.ptr[k]; q < A.ptr[k + 1]; ++q) A.val[q] = 0.0;
         for (int e = P.fptr[k]; e < P.fptr[k + 1]; ++e) {
             const int f = P.face[e], sl = P.slot[e];
             const double a = p.beta[f] * P.area[e] / P.dist[e];
@@ -692,57 +737,62 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
     const int n = m.nLeaves();
     if ((int)x.size() != m.nCells()) x.resize(m.nCells(), 0.0);
 
-    System S;
+    static System S;  // reused storage (solve is not reentrant)
     assemble(m, p, S);
     const std::vector<int>& leaves = S.pat->order;  // row -> cell
     const std::vector<double>& w = S.invV;
     std::vector<double>& B = S.b;
 
     double vol = 0.0;
+#pragma omp parallel for simd reduction(+ : vol) schedule(static) if (n > kPar)
     for (int k = 0; k < n; ++k) vol += 1.0 / w[k];
     if (S.singular) {  // compatibility: remove the volume-weighted mean of b
         double s = 0.0;
+#pragma omp parallel for simd reduction(+ : s) schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) s += B[k];
         const double mean = s / vol;
+#pragma omp parallel for schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) B[k] -= mean / w[k];
     }
 
     auto wnorm = [&](const std::vector<double>& r) {
         double s = 0.0;
-#pragma omp parallel for reduction(+ : s) schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for simd reduction(+ : s) schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) s += r[k] * r[k] * w[k];
         return std::sqrt(s);
     };
     auto projectMean = [&](std::vector<double>& v) {  // Euclidean mean (range of A)
         double s = 0.0;
-#pragma omp parallel for reduction(+ : s) schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for simd reduction(+ : s) schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) s += v[k];
         s /= n;
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) v[k] -= s;
     };
 
-    std::vector<double> xs(n), r, z, d, q;  // CPU work vectors: sized below if used
+    static std::vector<double> xs, r, z, d, q;  // CPU work vectors: sized below if used
+    xs.resize(n);
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int k = 0; k < n; ++k) xs[k] = x[leaves[k]];
 
     // ---- preconditioner
-    Amg amg;
-    std::vector<double> jac;
+    static Amg amg;
+    static std::vector<double> jac;
     const bool useAmg = opt.precond != 0;
     bool onGpu = false;
 #ifdef VOF2D_CUDA
-    onGpu = opt.gpu && n >= kGpuMin && gpu::available();
+    onGpu = opt.gpu && n >= opt.gpuMin && gpu::available();
 #endif
-    if (useAmg)  // the hierarchy owns the finest matrix
-        amg.setup(std::move(S.A), S.singular, onGpu ? kGpuAggressive : kMaxLevels);
+    if (useAmg)
+        amg.setup(S.A, S.singular, onGpu ? kGpuAggressive : kMaxLevels);
     else
-        jac = invDiag(S.A);
-    const Csr& A = useAmg ? amg.matrix(0) : S.A;
+        invDiag(S.A, jac);
+    const Csr& A = S.A;
     auto precondition = [&](const std::vector<double>& rr, std::vector<double>& zz) {
         if (useAmg) {
             amg.apply(rr.data(), zz.data());
         } else {
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
             for (int k = 0; k < n; ++k) zz[k] = jac[k] * rr[k];
         }
         if (S.singular) projectMean(zz);
@@ -816,22 +866,28 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
         d = z;
         while (it < opt.maxIter) {
             ++it;
-            spmv(A, d.data(), q.data());
-            const double rho = dot(d.data(), q.data(), n);
+            double rho, dr;
+            spmvDots(A, d.data(), r.data(), q.data(), rho, dr);
             if (!(rho > 0.0)) break;
-            const double alpha = dot(d.data(), r.data(), n) / rho;
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+            const double alpha = dr / rho;
+            double rr = 0.0;
+#pragma omp parallel for simd schedule(static) reduction(+ : rr) if (n > kPar)
             for (int k = 0; k < n; ++k) {
                 xs[k] += alpha * d[k];
                 r[k] -= alpha * q[k];
+                rr += r[k] * r[k] * w[k];
             }
-            if (S.singular && it % 8 == 0) projectMean(r);
-            rn = wnorm(r);
+            if (S.singular && it % 8 == 0) {
+                projectMean(r);
+                rn = wnorm(r);
+            } else {
+                rn = std::sqrt(rr);
+            }
             if (opt.verbose) std::printf("  poisson it %3d  rel.res %.3e\n", it, bn > 0 ? rn / bn : rn);
             if (done(rn)) { rconv = true; break; }
             precondition(r, z);
             const double beta = dot(z.data(), q.data(), n) / rho;
-#pragma omp parallel for schedule(static) num_threads(nthr(n)) if (n > kPar)
+#pragma omp parallel for schedule(static) if (n > kPar)
             for (int k = 0; k < n; ++k) d[k] = z[k] - beta * d[k];
         }
         if (!rconv) {  // maxIter reached or breakdown
@@ -843,11 +899,17 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
 
     if (S.singular) {  // zero volume-weighted mean
         double s = 0.0;
+#pragma omp parallel for simd reduction(+ : s) schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) s += xs[k] / w[k];
         s /= vol;
+#pragma omp parallel for schedule(static) if (n > kPar)
         for (int k = 0; k < n; ++k) xs[k] -= s;
     }
+#pragma omp parallel for schedule(static) if (n > kPar)
     for (int k = 0; k < n; ++k) x[leaves[k]] = xs[k];
+    gTiming.solves++;
+    gTiming.setup += t1 - t0;
+    gTiming.iterate += now() - t1;
 
     res.iterations = it;
     res.residual = bn > 0.0 ? rn / bn : rn;
@@ -868,6 +930,8 @@ Result solve(const Mesh& m, const Problem& p, std::vector<double>& x, const Opti
     }
     return res;
 }
+
+Timing timing() { return gTiming; }
 
 std::string gpuDevice() {
 #ifdef VOF2D_CUDA

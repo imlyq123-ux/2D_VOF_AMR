@@ -208,11 +208,15 @@ poisson::Result projectFaces(State& s, double dt, bool withAccel, std::vector<do
     const auto& leaves = m.leaves();
     const int nf = m.nFaces(), nl = m.nLeaves();
 
-    std::vector<double> alpha;
+    // reused work storage (every entry used is rewritten below)
+    static poisson::Problem P;
+    static std::vector<double> acc;
+    static std::vector<char> dirichlet;
+    std::vector<double>& alpha = P.beta;
     faceProperties(s, &alpha, nullptr);
     if (fromCells) cellToFace(s, s.uf);
-    std::vector<double> acc(withAccel ? nf : 0, 0.0);
-    std::vector<char> dirichlet(nf, 0);
+    acc.resize(withAccel ? nf : 0);
+    dirichlet.resize(nf);
     bool anyDir = false;
 #pragma omp parallel for schedule(static) reduction(|| : anyDir) if (nf > kParMin)
     for (int k = 0; k < nf; ++k) {
@@ -221,16 +225,15 @@ poisson::Result projectFaces(State& s, double dt, bool withAccel, std::vector<do
         const bool dir = !interior && isPressureDirichlet(prm, F);
         dirichlet[k] = dir;
         anyDir = anyDir || dir;
-        if (withAccel && (interior || dir)) {
-            acc[k] = faceAcceleration(s, F, alpha[k]);
+        if (withAccel) {
+            acc[k] = interior || dir ? faceAcceleration(s, F, alpha[k]) : 0.0;
             s.uf[k] += dt * acc[k];
         }
     }
 
-    poisson::Problem P;
-    P.beta = alpha;
-    P.rhs.assign(m.nCells(), 0.0);
+    P.rhs.resize(m.nCells());  // leaf entries only
     if (anyDir) P.dirichlet = dirichlet;
+    else P.dirichlet.clear();
     const double idt = 1.0 / dt;
 #pragma omp parallel for schedule(static) if (nl > kParMin)
     for (int k = 0; k < nl; ++k) {
@@ -249,14 +252,17 @@ poisson::Result projectFaces(State& s, double dt, bool withAccel, std::vector<do
     if ((int)p.size() != m.nCells()) p.assign(m.nCells(), 0.0);
     const poisson::Result r = poisson::solve(m, P, p, opt);
 
-    if (g) g->assign(nf, 0.0);
+    if (g) g->resize(nf);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
     for (int k = 0; k < nf; ++k) {
         const Face& F = faces[k];
         double gp;
         if (F.L >= 0 && F.R >= 0) gp = (p[F.R] - p[F.L]) / F.dist;
         else if (dirichlet[k]) gp = F.L >= 0 ? -p[F.L] / F.dist : p[F.R] / F.dist;
-        else continue;  // prescribed normal velocity: uf unchanged, g_f = 0
+        else {  // prescribed normal velocity: uf unchanged, g_f = 0
+            if (g) (*g)[k] = 0.0;
+            continue;
+        }
         s.uf[k] -= dt * alpha[k] * gp;
         if (g) (*g)[k] = (withAccel ? acc[k] : 0.0) - alpha[k] * gp;
     }
@@ -294,13 +300,14 @@ void bcgFaceValues(const State& s, const std::vector<double>& uf, double dt, boo
     // ---- 1. per cell: limited slopes (normal extrapolation), upwind one-sided slopes
     //      (transverse term), central slopes (transpose term), all [comp][dir]; and the
     //      cell-averaged advecting velocity ufc[dir]
-    std::vector<double> lim[2][2], tr[2][2], ufc[2];
+    // reused work storage, leaf entries only
+    static std::vector<double> lim[2][2], tr[2][2], ufc[2];
     for (int a = 0; a < 2; ++a) {
-        ufc[a].assign(nc, 0.0);
+        ufc[a].resize(nc);
         for (int d = 0; d < 2; ++d) {
-            lim[a][d].assign(nc, 0.0);
-            tr[a][d].assign(nc, 0.0);
-            if (transpose) cen[a][d].assign(nc, 0.0);
+            lim[a][d].resize(nc);
+            tr[a][d].resize(nc);
+            if (transpose) cen[a][d].resize(nc);
         }
     }
 #pragma omp parallel for schedule(static) if (nl > kParMin)
@@ -331,7 +338,7 @@ void bcgFaceValues(const State& s, const std::vector<double>& uf, double dt, boo
     //      q_f = q_U + (+-h_U - uf dt)/2 dq/dn + (tangential offset) dq/dt
     //            - dt/2 u_t,U (dq/dt)_upwind + dt/4 (g_L + g_R)
     auto& qf = out.qf;
-    for (int a = 0; a < 2; ++a) qf[a].assign(faceValues ? nf : 0, 0.0);
+    for (int a = 0; a < 2; ++a) qf[a].resize(faceValues ? nf : 0);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
     for (int k = 0; k < (faceValues ? nf : 0); ++k) {
         const Face& F = faces[k];
@@ -495,7 +502,7 @@ void advanceMomentum(State& s, double dt) {
     // ---- 1.-2. limited slopes and time-centred face values (skipped with
     //      prm.conservingMomentum: momentum was advected with the VOF fluxes, see sim::step)
     const bool advect = !prm.conservingMomentum;
-    FaceStates fs;
+    static FaceStates fs;  // reused work storage
     bcgFaceValues(s, uf, dt, advect, transpose, fs);
     const std::vector<double>(&qf)[2] = fs.qf;
     const std::vector<double>(&cen)[2][2] = fs.cen;
@@ -505,8 +512,15 @@ void advanceMomentum(State& s, double dt) {
         if (id >= 0) gc[a] = &m.field(id);
     }
 
-    // ---- 3. advected velocity
-    std::vector<double> qa[2] = {*q[0], *q[1]};
+    // ---- 3. advected velocity (qa: reused storage, swapped into the fields at the end)
+    static std::vector<double> qa[2];
+    for (int a = 0; a < 2; ++a) {
+        qa[a].resize(nc);
+        const double* src = q[a]->data();
+        double* dst = qa[a].data();
+#pragma omp parallel for schedule(static) if (nc > kParMin)
+        for (int c = 0; c < nc; ++c) dst[c] = src[c];
+    }
 #pragma omp parallel for schedule(static) if (nl > kParMin)
     for (int k = 0; k < (advect ? nl : 0); ++k) {
         const int c = leaves[k];
@@ -521,20 +535,22 @@ void advanceMomentum(State& s, double dt) {
     }
 
     if (!viscous) {
-        *q[0] = std::move(qa[0]);
-        *q[1] = std::move(qa[1]);
+        q[0]->swap(qa[0]);
+        q[1]->swap(qa[1]);
         return;
     }
 
     // ---- 4. viscosity
-    std::vector<double> muf;
+    static std::vector<double> muf;
     faceProperties(s, nullptr, &muf);
     const std::vector<double>& rho = s.F(s.id.rho);
 
     // explicit transpose term T_a = div(mu (d u_dir / d x_a)) from u^n
-    std::vector<double> T[2];
+    static std::vector<double> T[2];
     if (transpose) {
-        std::vector<double> tf[2] = {std::vector<double>(nf), std::vector<double>(nf)};
+        static std::vector<double> tf[2];
+        tf[0].resize(nf);
+        tf[1].resize(nf);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
         for (int k = 0; k < nf; ++k) {
             const Face& F = faces[k];
@@ -553,7 +569,7 @@ void advanceMomentum(State& s, double dt) {
                 tf[a][k] = F.area * muf[k] * D;
             }
         }
-        for (int a = 0; a < 2; ++a) T[a].assign(nc, 0.0);
+        for (int a = 0; a < 2; ++a) T[a].resize(nc);  // leaf entries only
 #pragma omp parallel for schedule(static) if (nl > kParMin)
         for (int k = 0; k < nl; ++k) {
             const int c = leaves[k];
@@ -572,14 +588,20 @@ void advanceMomentum(State& s, double dt) {
     if (prm.implicitViscosity) {
         // (rho/dt) u - div(mu_f grad u) = (rho/dt) u_adv + T, per component
         double muMax = std::max(prm.mu1, prm.mu2);
-        poisson::Problem P;
+        static poisson::Problem P;  // reused work storage
         P.beta.resize(nf);
-        for (int k = 0; k < nf; ++k) P.beta[k] = std::max(muf[k], 1e-30 * muMax);
-        P.lambda.assign(nc, 0.0);
-        P.rhs.assign(nc, 0.0);
-        P.dirichlet.assign(nf, 0);
-        P.bvalue.assign(nf, 0.0);
-        for (int c : leaves) P.lambda[c] = rho[c] / dt;
+        P.dirichlet.resize(nf);
+        P.bvalue.resize(nf);
+#pragma omp parallel for schedule(static) if (nf > kParMin)
+        for (int k = 0; k < nf; ++k) {
+            P.beta[k] = std::max(muf[k], 1e-30 * muMax);
+            P.dirichlet[k] = 0;  // boundary faces: set per component below
+            P.bvalue[k] = 0.0;
+        }
+        P.lambda.resize(nc);  // leaf entries only
+        P.rhs.resize(nc);
+#pragma omp parallel for schedule(static) if (nl > kParMin)
+        for (int k = 0; k < nl; ++k) P.lambda[leaves[k]] = rho[leaves[k]] / dt;
         poisson::Options opt;
         opt.tol = prm.poissonTol;
         opt.maxIter = prm.poissonMaxIter;
@@ -599,8 +621,10 @@ void advanceMomentum(State& s, double dt) {
         for (int a = 0; a < 2; ++a) {
             // solve for u* + dt g (the velocity after the coming projection, to first order)
             // so that the viscous operator acts on the corrected velocity (as in Basilisk)
-            if (gc[a])
-                for (int c : leaves) qa[a][c] += dt * (*gc[a])[c];
+            if (gc[a]) {
+#pragma omp parallel for schedule(static) if (nl > kParMin)
+                for (int k = 0; k < nl; ++k) qa[a][leaves[k]] += dt * (*gc[a])[leaves[k]];
+            }
 #pragma omp parallel for schedule(static) if (nf > kParMin)
             for (int k = 0; k < nf; ++k) {
                 const Face& F = faces[k];
@@ -610,12 +634,14 @@ void advanceMomentum(State& s, double dt) {
                 P.dirichlet[k] = d;
             }
             // explicit (lagged) tangential correction of the two-point flux at 2:1 faces
-            std::vector<double> cf(nf, 0.0);
+            static std::vector<double> cf;
+            cf.resize(nf);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
             for (int k = 0; k < nf; ++k) {
                 const Face& F = faces[k];
-                if (F.L >= 0 && F.R >= 0 && m.level(F.L) != m.level(F.R))
-                    cf[k] = F.area * muf[k] * coarseFineDelta(m, prm, qa[a], a, F) / F.dist;
+                cf[k] = F.L >= 0 && F.R >= 0 && m.level(F.L) != m.level(F.R)
+                            ? F.area * muf[k] * coarseFineDelta(m, prm, qa[a], a, F) / F.dist
+                            : 0.0;
             }
 #pragma omp parallel for schedule(static) if (nl > kParMin)
             for (int k = 0; k < nl; ++k) {
@@ -626,12 +652,16 @@ void advanceMomentum(State& s, double dt) {
                 P.rhs[c] = P.lambda[c] * qa[a][c] + (transpose ? T[a][c] : 0.0) + corr / m.volume(c);
             }
             poisson::solve(m, P, qa[a], opt);
-            if (gc[a])
-                for (int c : leaves) qa[a][c] -= dt * (*gc[a])[c];
-            *q[a] = qa[a];
+            if (gc[a]) {
+#pragma omp parallel for schedule(static) if (nl > kParMin)
+                for (int k = 0; k < nl; ++k) qa[a][leaves[k]] -= dt * (*gc[a])[leaves[k]];
+            }
+            q[a]->swap(qa[a]);
         }
     } else {
-        std::vector<double> lf[2] = {std::vector<double>(nf), std::vector<double>(nf)};
+        static std::vector<double> lf[2];
+        lf[0].resize(nf);
+        lf[1].resize(nf);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
         for (int k = 0; k < nf; ++k) {
             const Face& F = faces[k];
@@ -652,8 +682,8 @@ void advanceMomentum(State& s, double dt) {
             for (int a = 0; a < 2; ++a)
                 qa[a][c] += dt / rho[c] * (l[a] * iv + (transpose ? T[a][c] : 0.0));
         }
-        *q[0] = std::move(qa[0]);
-        *q[1] = std::move(qa[1]);
+        q[0]->swap(qa[0]);
+        q[1]->swap(qa[1]);
     }
 }
 
@@ -669,7 +699,7 @@ poisson::Result predictFaceVelocity(State& s, double dt) {
     // normal component of the time-centred BCG face values (includes dt/2 of the
     // previous cell acceleration g, i.e. the lagged pressure gradient and body forces);
     // boundary faces get the BC value (0 on walls, prescribed on inflow)
-    FaceStates fs;
+    static FaceStates fs;  // reused work storage
     bcgFaceValues(s, ufOld, dt, true, false, fs);
     s.uf.resize(nf);
 #pragma omp parallel for schedule(static) if (nf > kParMin)
@@ -691,7 +721,7 @@ poisson::Result project(State& s, double dt, bool withAccel) {
     const Mesh& m = s.m();
     const auto& faces = m.faces();
     const auto& leaves = m.leaves();
-    std::vector<double> g;
+    static std::vector<double> g;  // reused work storage
     const poisson::Result r = projectFaces(s, dt, withAccel, s.F(s.id.p), &g);
     s.lastPoissonIters = r.iterations;
 

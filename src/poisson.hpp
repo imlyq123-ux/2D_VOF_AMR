@@ -41,10 +41,11 @@ struct Options {
     // Preconditioner (added by the linear-solver module):
     //   1 = aggregation AMG, K-cycle (default);  0 = Jacobi (simple fallback).
     int precond = 1;
-    // Run the iteration on the CUDA device (CUDA builds only; ignored otherwise). Systems
-    // smaller than a few ten thousand unknowns, for which the GPU does not pay off, are
-    // still solved on the CPU.
+    // Run the iteration on the CUDA device (CUDA builds only; ignored otherwise) if the
+    // system has at least gpuMin unknowns. Smaller systems are faster on the CPU (measured
+    // crossover ~1.5e5 unknowns in full time steps: RTX 4060 Ti vs 8 Zen 4 cores).
     bool gpu = false;
+    int gpuMin = 120000;
 };
 
 struct Result {
@@ -57,6 +58,14 @@ struct Result {
 // the solution. Non-leaf entries are left untouched. Not reentrant (the matrix pattern of
 // the last mesh and the GPU buffers are kept between calls).
 Result solve(const Mesh& m, const Problem& prob, std::vector<double>& x, const Options& opt);
+
+// Wall time spent in solve() since the start of the process, split into assembly +
+// preconditioner setup and the Krylov iteration.
+struct Timing {
+    int solves = 0;
+    double setup = 0.0, iterate = 0.0;  // seconds
+};
+Timing timing();
 
 // Name of the CUDA device used for Options::gpu, or "" if there is none (CPU-only build or
 // no usable device; the solver then runs on the CPU).

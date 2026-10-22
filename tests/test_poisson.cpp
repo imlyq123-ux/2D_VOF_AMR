@@ -387,8 +387,8 @@ void testMisc() {
     std::printf("  failure reporting, zero rhs, tiny periodic mesh, non-leaf entries: checked\n");
 }
 
-// CUDA backend: same answers as the CPU solver (Options::gpu), on systems large enough
-// to be sent to the device. Skipped without a usable device.
+// CUDA backend: same answers as the CPU solver (Options::gpu, forced to the device with
+// Options::gpuMin = 0). Skipped without a usable device.
 void testGpu() {
     std::printf("GPU solver:\n");
     if (poisson::gpuDevice().empty()) {
@@ -402,6 +402,7 @@ void testGpu() {
         o.gpu = false;
         const poisson::Result rc = poisson::solve(m, p, xc, o);
         o.gpu = true;
+        o.gpuMin = 0;
         const poisson::Result rg = poisson::solve(m, p, xg, o);
         double d = 0, s = 0;
         for (int c : m.leaves()) { d = std::max(d, std::fabs(xc[c] - xg[c])); s = std::max(s, std::fabs(xc[c])); }
@@ -436,6 +437,7 @@ void testGpu() {
     for (int c = 0; c < am->nCells(); ++c) if (!am->isLeaf(c)) x0[c] = 42.0;
     poisson::Options og;
     og.gpu = true;
+    og.gpuMin = 0;
     const poisson::Result r0 = poisson::solve(*am, p, x0, og);
     bool untouched = true;
     for (int c = 0; c < am->nCells(); ++c) if (!am->isLeaf(c) && x0[c] != 42.0) untouched = false;
@@ -459,6 +461,7 @@ void testGpu() {
     // maxIter exhaustion is reported
     poisson::Options of;
     of.gpu = true;
+    of.gpuMin = 0;
     of.maxIter = 2;
     of.tol = 1e-14;
     std::vector<double> xf(am->nCells(), 0.0);
@@ -492,6 +495,7 @@ void bench(bool gpu) {
             std::vector<double> x(m->nCells(), 0.0);
             poisson::Options o;
             o.gpu = gpu;
+            o.gpuMin = 0;
             const double t0 = now();
             poisson::Result r = poisson::solve(*m, p, x, o);
             const double t1 = now();

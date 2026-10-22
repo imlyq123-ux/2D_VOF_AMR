@@ -22,7 +22,8 @@ OpenMP, optional CUDA for the linear solves):
 * **Pressure**: flexible CG preconditioned by aggregation AMG (K-cycle); ~15–25
   iterations independent of mesh size and density ratio. With `make CUDA=1` the
   pressure and implicit-viscosity solves run on an NVIDIA GPU (see [GPU](#gpu-cuda)).
-* **AMR**: cell-based quadtree, 2:1 balanced (incl. corners), O(1) neighbour lookup.
+* **AMR**: cell-based quadtree, 2:1 balanced (incl. corners), O(1) neighbour lookup;
+  memory and regrid cost grow with the number of cells, not with 4^maxLevel.
   The interface is always at the finest level with a buffer; elsewhere the mesh follows
   a wavelet estimate of the velocity. All operators are face-flux based, so they are
   conservative across resolution jumps.
@@ -31,7 +32,7 @@ OpenMP, optional CUDA for the linear solves):
 
 ```bash
 make -j            # bin/vof2d
-make check         # builds and runs all unit tests (~35 s)
+make check         # builds and runs all unit tests (~30 s)
 
 make -j CUDA=1     # same, with the CUDA linear solver (needs nvcc, see below)
 make CUDA=1 check  # also checks the GPU solver against the CPU one
@@ -70,6 +71,43 @@ python3 scripts/make_video.py output/rising_bubble                          # MP
 python3 scripts/make_video.py output/static_drop --field3 speed --log --diag umax --diag-log --normalize-arrows
 ```
 
+## Performance
+
+* **Threads**: set `OMP_NUM_THREADS` to the number of physical cores (8 on a Ryzen 7
+  7700X). Using all SMT threads is slower: the multigrid cycle runs thousands of short
+  parallel regions per solve, and every barrier waits for the slowest thread.
+* At the end of a run, `vof2d` prints the wall time per step of each phase and the
+  linear-solver share, e.g.
+  ```
+  done: 40 steps, t = 0.00922951, wall 0.8 s (18.77 ms/step)
+  time per step (ms):  advection 0.34  properties+curvature 0.67  momentum+viscosity 3.18  projection 12.84  regrid 1.46
+    of which linear solves: 121 solves, setup 2.21, iterations 12.37
+  ```
+* Memory and regrid time follow the number of cells, so deep AMR is practical. Rising
+  bubble, `minLevel=5`, regrid every step, 8 threads:
+
+  | maxLevel | leaves | ms/step | peak memory |
+  |---------:|-------:|--------:|------------:|
+  | 11 | 57,164 | 34 | 83 MB |
+  | 12 | 112,904 | 76 | 157 MB |
+  | 13 | 224,456 | 156 | 300 MB |
+  | 14 | 448,040 | 321 | 594 MB |
+
+CPU time per step (Ryzen 7 7700X, 8 cores, WSL2, 40 steps) before and after the
+OpenMP / memory work of this version (fixed thread teams, no per-step reallocation,
+parallel setup and regrid, sparse mesh maps):
+
+| run | leaves | before ms/step | now ms/step | speed-up |
+|-----|-------:|---------------:|------------:|---------:|
+| `rising_bubble.cfg minLevel=7 maxLevel=9` | 44,060 | 40.5 | 18.3 | 2.2× |
+| `dam_break.cfg minLevel=8 maxLevel=10` | 72,448 | 58.3 | 32.9 | 1.8× |
+| `rayleigh_taylor.cfg minLevel=7 maxLevel=9` | 72,460 | 72.9 | 38.6 | 1.9× |
+| `breaking_wave.cfg minLevel=8 maxLevel=10` | 81,064 | 108.2 | 59.6 | 1.8× |
+| `rising_bubble.cfg minLevel=9 maxLevel=11` | 569,252 | 456.8 | 264.1 | 1.7× |
+
+Results are unchanged: on the default cases the meshes are identical step by step and
+the diagnostics agree to the printed precision.
+
 ## GPU (CUDA)
 
 `make CUDA=1` builds `bin/vof2d` with a CUDA backend for the elliptic solves (pressure
@@ -85,8 +123,9 @@ make -j CUDA=1 CUDA_ARCH=sm_86                     # default: native (the GPU of
 ```
 
 * `gpu = true` is the default of CUDA builds; without a usable device, or in a CPU-only
-  build, the run prints a warning and solves on the CPU. Systems with fewer than 30,000
-  unknowns are always solved on the CPU (the GPU does not pay off there).
+  build, the run prints a warning and solves on the CPU. Systems with fewer than 120,000
+  unknowns are always solved on the CPU (below ~150k unknowns the multithreaded CPU
+  solver is faster; `poisson::Options::gpuMin`).
 * The assembly and the AMG hierarchy are built on the host as for the CPU solver; the whole
   flexible-CG / K-cycle iteration runs in a single cooperative kernel (no per-operation
   launches or host round trips, which matters especially under WSL). Differences to the
@@ -97,19 +136,25 @@ make -j CUDA=1 CUDA_ARCH=sm_86                     # default: native (the GPU of
 * Only the toolkit's `nvcc` and the CUDA runtime (linked statically) are needed; the
   device code takes about a minute to compile.
 
-Measured on an RTX 4060 Ti (WSL2), host part with `OMP_NUM_THREADS=4`, 40 steps:
+Measured on an RTX 4060 Ti (WSL2), host part with `OMP_NUM_THREADS=4`, 40 steps. To show
+where the GPU pays off, the GPU column sends every linear solve of ≥ 30,000 unknowns to
+the device (`poisson::Options::gpuMin = 30000`; with the default of 120,000 the first four
+runs solve on the CPU):
 
 | run | leaves | CPU ms/step | GPU ms/step |
 |-----|-------:|------------:|------------:|
-| `rising_bubble.cfg minLevel=7 maxLevel=9` | 44,060 | 44.5 | 30.6 |
-| `dam_break.cfg minLevel=8 maxLevel=10` | 72,448 | 60.9 | 49.5 |
-| `rayleigh_taylor.cfg minLevel=7 maxLevel=9` | 72,460 | 75.3 | 58.7 |
-| `breaking_wave.cfg minLevel=8 maxLevel=10` | 81,064 | 114.8 | 81.9 |
-| `rising_bubble.cfg minLevel=9 maxLevel=11` | 569,252 | 489 | 271 |
+| `rising_bubble.cfg minLevel=7 maxLevel=9` | 44,060 | 19.5 | 24.7 |
+| `dam_break.cfg minLevel=8 maxLevel=10` | 72,448 | 36.4 | 41.7 |
+| `rayleigh_taylor.cfg minLevel=7 maxLevel=9` | 72,460 | 39.6 | 45.8 |
+| `breaking_wave.cfg minLevel=8 maxLevel=10` | 81,064 | 65.9 | 67.6 |
+| `rising_bubble.cfg minLevel=8 maxLevel=10` (8 threads) | 153,548 | 57.9 | 55.1 |
+| `dam_break.cfg minLevel=9 maxLevel=11` (8 threads) | 276,895 | 133.7 | 118.7 |
+| `rising_bubble.cfg minLevel=9 maxLevel=11` | 569,252 | 281 | 198 |
 
-For a single solve the GPU is 2.5–4× faster than one CPU core on 0.3–1 M unknowns
-(`bin/test_poisson --bench` vs `--bench --gpu`); end to end, the host part (assembly, AMG setup, the rest of the time
-step) limits the gain. The default cases (a few thousand leaves) run entirely on the CPU.
+With the multithreaded CPU solver the GPU only pays off above ~150k unknowns, hence the
+120,000 default threshold. End to end, the host part (assembly, AMG setup, the rest of the
+time step) limits the gain. The default cases (a few thousand leaves) run entirely on the
+CPU.
 
 ## Gallery
 
@@ -256,9 +301,10 @@ docs/ARCHITECTURE.md  design notes and conventions
   ~5e-10 by t = 7 before the drift starts. Irrelevant for flows that are not at rest.
 * Contact lines: walls act as a 90° contact angle.
 * For small meshes (< ~10^4 leaves) OpenMP brings little; use `OMP_NUM_THREADS=1..4`.
-* CUDA: only the linear solves run on the GPU, and only for systems of ≥ 30,000 unknowns.
-* Memory: per-level dense index maps (4 bytes × (nx0·ny0·4^maxLevel) at the finest
-  level), fine up to maxLevel ≈ 11–12 in 2D.
+  Large loops are memory-bandwidth bound: on a dual-channel desktop, 4 → 8 threads gains
+  only ~10–20 %.
+* CUDA: only the linear solves run on the GPU, and only for systems of ≥ 120,000 unknowns.
+* `maxLevel` ≤ 14 (index range of the mesh); memory is ~1.3–1.5 kB per leaf.
 
 ## Figures
 

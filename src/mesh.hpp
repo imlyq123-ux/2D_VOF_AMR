@@ -13,7 +13,10 @@
 // Storage
 //   * Cells (leaves AND their ancestors) have a compact index c in [0, nCells()).
 //     Cells are ordered by level (coarse first), so a reverse loop visits children
-//     before parents.
+//     before parents; within a level they are row-major (j, then i).
+//   * The (L, i, j) -> cell lookup is a per-level map that is sparse (tiled) on large
+//     levels (see TileMap): memory and regrid time scale with the number of cells, not
+//     with 4^maxLevel.
 //   * Fields are std::vector<double> of size nCells() owned by the mesh; they are
 //     transferred automatically by adapt() (copy / prolongation / restriction).
 //   * Only leaf values are "the solution". Parent values are meaningful only after
@@ -163,13 +166,83 @@ public:
     std::string checkConsistency() const;
 
 private:
+    // Map over the (i, j) index space of one level. Large levels are sparse: kTile x kTile
+    // tiles allocated on demand, found through a dense directory with one entry per tile,
+    // so that memory is O(allocated tiles) + O(4^level / kTile^2) instead of O(4^level).
+    // Levels of at most kDenseMax positions are a plain dense array (one load per lookup).
+    // get() is safe to call concurrently; set() is not.
+    template <class T>
+    class TileMap {
+    public:
+        static constexpr int kShift = 4, kTile = 1 << kShift, kMask = kTile - 1;
+        static constexpr size_t kDenseMax = size_t(1) << 20;
+        TileMap() = default;
+        TileMap(int nx, int ny, T empty) : nx_(nx), ny_(ny), empty_(empty) {
+            if ((size_t)nx * ny <= kDenseMax) data_.assign((size_t)nx * ny, empty);
+            else { tnx_ = (nx + kMask) >> kShift; dir_.assign((size_t)tnx_ * ((ny + kMask) >> kShift), -1); }
+        }
+        T get(int i, int j) const {
+            if (tnx_ == 0) return data_[(size_t)j * nx_ + i];
+            const int t = dir_[(size_t)(j >> kShift) * tnx_ + (i >> kShift)];
+            return t < 0 ? empty_ : data_[((size_t)t << (2 * kShift)) + ((j & kMask) << kShift) + (i & kMask)];
+        }
+        void set(int i, int j, T v) {
+            if (tnx_ == 0) {
+                T& e = data_[(size_t)j * nx_ + i];
+                count_ += (e == empty_) - (v == empty_);
+                e = v;
+                return;
+            }
+            const size_t d = (size_t)(j >> kShift) * tnx_ + (i >> kShift);
+            int t = dir_[d];
+            if (t < 0) {
+                if (v == empty_) return;
+                t = dir_[d] = (int)tileDir_.size();
+                tileDir_.push_back(d);
+                data_.resize(data_.size() + kTile * kTile, empty_);
+            }
+            T& e = data_[((size_t)t << (2 * kShift)) + ((j & kMask) << kShift) + (i & kMask)];
+            count_ += (e == empty_) - (v == empty_);
+            e = v;
+        }
+        size_t count() const { return count_; }   // number of non-empty entries
+        // fn(i, j, value) for every non-empty entry with i and j multiples of `stride`
+        // (1 or 2), row by row or tile by tile
+        template <class F>
+        void forEach(F fn, int stride = 1) const {
+            if (tnx_ == 0) {
+                for (int j = 0; j < ny_; j += stride)
+                    for (int i = 0; i < nx_; i += stride)
+                        if (data_[(size_t)j * nx_ + i] != empty_) fn(i, j, data_[(size_t)j * nx_ + i]);
+                return;
+            }
+            for (size_t t = 0; t < tileDir_.size(); ++t) {
+                const int i0 = (int)(tileDir_[t] % tnx_) << kShift, j0 = (int)(tileDir_[t] / tnx_) << kShift;
+                const T* v = &data_[t << (2 * kShift)];
+                for (int b = 0; b < kTile; b += stride)
+                    for (int a = 0; a < kTile; a += stride)
+                        if (v[(b << kShift) + a] != empty_) fn(i0 + a, j0 + b, v[(b << kShift) + a]);
+            }
+        }
+
+    private:
+        int nx_ = 0, ny_ = 0;
+        int tnx_ = 0;                  // directory width; 0: dense level
+        T empty_{};
+        std::vector<int> dir_;         // tile index per directory entry, -1: none
+        std::vector<size_t> tileDir_;  // directory entry of each tile
+        std::vector<T> data_;          // dense: nx * ny values; else kTile^2 values per tile
+        size_t count_ = 0;
+    };
+
     Config cfg_;
     uint64_t revision_ = 0;
     std::vector<double> h_;
-    // per-level dense maps (L, i, j) -> cell index or -1
-    std::vector<std::vector<int>> map_;
+    // per-level maps (L, i, j) -> cell index or -1
+    std::vector<TileMap<int>> map_;
     // per-cell arrays
     std::vector<int> lev_, ci_, cj_, parent_, child_, leafIdx_;
+    std::vector<int> levelStart_;   // cells of level L: [levelStart_[L], levelStart_[L + 1])
     std::vector<int> leaves_;
     std::vector<Face> faces_;
     std::vector<int> cellFaceOff_, cellFaces_;
@@ -178,9 +251,8 @@ private:
     std::vector<std::vector<double>> data_;
     std::vector<Prolongator> prolong_;
 
-    int& mapAt(int L, int i, int j) { return map_[L][(size_t)j * nx(L) + i]; }
-    int mapAt(int L, int i, int j) const { return map_[L][(size_t)j * nx(L) + i]; }
-    // Rebuild compact arrays from an existence map (exists[L][j*nx+i]).
-    void rebuild(const std::vector<std::vector<uint8_t>>& exists);
+    int mapAt(int L, int i, int j) const { return map_[L].get(i, j); }
+    // Rebuild compact arrays from an existence map (exists[L].get(i, j) != 0).
+    void rebuild(const std::vector<TileMap<uint8_t>>& exists);
     void buildFaces();
 };

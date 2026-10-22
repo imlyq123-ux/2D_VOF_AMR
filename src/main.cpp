@@ -10,6 +10,9 @@
 #include "cases.hpp"
 #include "io.hpp"
 #include "simulation.hpp"
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 static void usage() {
     std::printf("usage: vof2d [config.cfg] [key=value ...]\n  cases:");
@@ -18,6 +21,14 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+#ifdef __GLIBC__
+    // The time step allocates and frees many field-sized arrays. By default glibc serves
+    // each of them with a fresh mmap and returns it on free, so every step pays ~10^5
+    // page faults, which are serial and dominate the threaded loops on large meshes.
+    // Keep freed memory in the heap instead (the footprint stays at its peak).
+    mallopt(M_MMAP_THRESHOLD, 1 << 30);
+    mallopt(M_TRIM_THRESHOLD, 1 << 30);
+#endif
     try {
         int first = 1;
         io::ConfigMap map;

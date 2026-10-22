@@ -19,6 +19,21 @@ namespace {
 
 bool twoPhaseFlow(const State& s) { return !s.prm.vofOnly; }
 
+// Wall time per phase of the time step, accumulated over the run (printed by run()).
+enum Phase { kAdvect, kProperties, kPredictor, kMomentum, kProjection, kRegrid, kNPhases };
+const char* const kPhaseName[kNPhases] = {"advection", "properties+curvature", "MAC predictor",
+                                          "momentum+viscosity", "projection", "regrid"};
+double gPhaseTime[kNPhases] = {};
+
+class PhaseTimer {
+public:
+    explicit PhaseTimer(Phase p) : p_(p), t0_(std::chrono::steady_clock::now()) {}
+    ~PhaseTimer() { gPhaseTime[p_] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count(); }
+private:
+    Phase p_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
 void setInitialFields(State& s, const cases::CaseSetup& cs) {
     Mesh& m = s.m();
     auto& f = s.F(s.id.f);
@@ -127,6 +142,7 @@ void initialize(State& s, const cases::CaseSetup& cs) {
 }
 
 bool regrid(State& s, const cases::CaseSetup& cs) {
+    PhaseTimer timer(kRegrid);
     if (!s.m().adapt(amr::computeFlags(s))) return false;
     refreshDerived(s, cs, true);
     return true;
@@ -138,6 +154,7 @@ void step(State& s, const cases::CaseSetup& cs, double dtLimit) {
     double dt;
     if (!twoPhaseFlow(s)) {
         // CFL on the prescribed velocity at t, then advect with the mid-point velocity
+        PhaseTimer timer(kAdvect);
         faceVelocityFromStreamFunction(m, cs, s.t, s.uf);
         double rate = 0.0;
         for (int k = 0; k < m.nFaces(); ++k) rate = std::max(rate, std::fabs(s.uf[k]) / m.faces()[k].area);
@@ -146,20 +163,31 @@ void step(State& s, const cases::CaseSetup& cs, double dtLimit) {
         faceVelocityFromStreamFunction(m, cs, s.t + 0.5 * dt, s.uf);
         vof::advect(m, s.F(s.id.f), s.uf, dt, s.step, prm);
     } else {
-        dt = std::min(ns::stableDt(s), dtLimit);
-        if (prm.conservingMomentum) advectConserving(s, dt);
-        else vof::advect(m, s.F(s.id.f), s.uf, dt, s.step, prm);
-        ns::updateProperties(s);
-        if (prm.sigma != 0.0) curvature::compute(m, s.F(s.id.f), s.F(s.id.kappa));
+        {
+            PhaseTimer timer(kAdvect);
+            dt = std::min(ns::stableDt(s), dtLimit);
+            if (prm.conservingMomentum) advectConserving(s, dt);
+            else vof::advect(m, s.F(s.id.f), s.uf, dt, s.step, prm);
+        }
+        {
+            PhaseTimer timer(kProperties);
+            ns::updateProperties(s);
+            if (prm.sigma != 0.0) curvature::compute(m, s.F(s.id.f), s.F(s.id.kappa));
+        }
         // MAC-projected, time-centred advection velocity for the momentum (the momentum is
         // already transported by the VOF fluxes in conserving mode)
         if (prm.macPredictor && !prm.conservingMomentum) {
+            PhaseTimer timer(kPredictor);
             const poisson::Result r = ns::predictFaceVelocity(s, dt);
             if (!r.converged)
                 std::fprintf(stderr, "warning: step %d MAC predictor solve not converged (%d its, res %.2e)\n",
                              s.step, r.iterations, r.residual);
         }
-        ns::advanceMomentum(s, dt);
+        {
+            PhaseTimer timer(kMomentum);
+            ns::advanceMomentum(s, dt);
+        }
+        PhaseTimer timer(kProjection);
         const poisson::Result r = ns::project(s, dt);
         s.lastPoissonIters = r.iterations;
         if (!r.converged)
@@ -214,6 +242,7 @@ void run(State& s, const cases::CaseSetup& cs) {
 
     using clock = std::chrono::steady_clock;
     const auto tStart = clock::now();
+    const poisson::Timing pt0 = poisson::timing();  // excludes the solves of initialize()
     auto tLast = tStart;
     std::printf("case %s: %d leaves (levels %d..%d), tEnd = %g\n", prm.caseName.c_str(),
                 s.m().nLeaves(), prm.minLevel, prm.maxLevel, prm.tEnd);
@@ -256,6 +285,15 @@ void run(State& s, const cases::CaseSetup& cs) {
     const double wall = std::chrono::duration<double>(clock::now() - tStart).count();
     std::printf("done: %d steps, t = %g, wall %.1f s (%.2f ms/step)\n", s.step, s.t, wall,
                 1e3 * wall / std::max(1, s.step));
+    const double perStep = 1e3 / std::max(1, s.step);
+    std::printf("time per step (ms):");
+    for (int k = 0; k < kNPhases; ++k)
+        if (gPhaseTime[k] > 0.0) std::printf("  %s %.2f", kPhaseName[k], gPhaseTime[k] * perStep);
+    std::printf("\n");
+    const poisson::Timing pt = poisson::timing();
+    if (pt.solves > pt0.solves)
+        std::printf("  of which linear solves: %d solves, setup %.2f, iterations %.2f\n", pt.solves - pt0.solves,
+                    (pt.setup - pt0.setup) * perStep, (pt.iterate - pt0.iterate) * perStep);
 }
 
 }  // namespace sim

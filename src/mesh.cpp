@@ -5,8 +5,13 @@
 #include <atomic>
 #include <sstream>
 #include <stdexcept>
+#ifndef _OPENMP
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"  // serial build: omp pragmas are inert
+#endif
 
 namespace {
+constexpr int kPar = 16384;  // smaller loops run serially (OpenMP start-up cost)
+
 inline double minmod(double a, double b) {
     if (a * b <= 0.0) return 0.0;
     return std::fabs(a) < std::fabs(b) ? a : b;
@@ -18,9 +23,13 @@ Mesh::Mesh(const Config& cfg) : cfg_(cfg) {
         throw std::runtime_error("Mesh: invalid minLevel/maxLevel");
     h_.resize(cfg_.maxLevel + 1);
     for (int L = 0; L <= cfg_.maxLevel; ++L) h_[L] = cfg_.L0 / double(1 << L);
-    std::vector<std::vector<uint8_t>> exists(cfg_.maxLevel + 1);
-    for (int L = 0; L <= cfg_.maxLevel; ++L)
-        exists[L].assign((size_t)nx(L) * ny(L), L <= cfg_.minLevel ? 1 : 0);
+    std::vector<TileMap<uint8_t>> exists;
+    for (int L = 0; L <= cfg_.maxLevel; ++L) {
+        exists.emplace_back(nx(L), ny(L), 0);
+        if (L <= cfg_.minLevel)
+            for (int j = 0; j < ny(L); ++j)
+                for (int i = 0; i < nx(L); ++i) exists[L].set(i, j, 1);
+    }
     rebuild(exists);
 }
 
@@ -89,10 +98,16 @@ int Mesh::fieldId(const std::string& name) const {
 void Mesh::restrict(int id) { restrict(data_[id]); }
 
 void Mesh::restrict(std::vector<double>& d) const {
-    for (int c = nCells() - 1; c >= 0; --c) {
-        if (isLeaf(c)) continue;
-        const int* ch = &child_[4 * c];
-        d[c] = 0.25 * (d[ch[0]] + d[ch[1]] + d[ch[2]] + d[ch[3]]);
+    // level by level, finest parents first; the parents of one level are independent
+#pragma omp parallel if (nCells() > kPar)
+    for (int L = cfg_.maxLevel - 1; L >= 0; --L) {
+        const int b = levelStart_[L], e = levelStart_[L + 1];
+#pragma omp for schedule(static)
+        for (int c = b; c < e; ++c) {
+            if (isLeaf(c)) continue;
+            const int* ch = &child_[4 * c];
+            d[c] = 0.25 * (d[ch[0]] + d[ch[1]] + d[ch[2]] + d[ch[3]]);
+        }
     }
 }
 
@@ -114,40 +129,58 @@ void Mesh::prolongLinear(const Mesh& m, const std::vector<double>& d, int p, dou
 
 // ------------------------------------------------------------------ rebuild
 
-void Mesh::rebuild(const std::vector<std::vector<uint8_t>>& exists) {
+void Mesh::rebuild(const std::vector<TileMap<uint8_t>>& exists) {
     static std::atomic<uint64_t> lastRevision{0};
     revision_ = ++lastRevision;
     const int Lmax = cfg_.maxLevel;
     // keep old state for field transfer
-    std::vector<std::vector<int>> oldMap;
+    std::vector<TileMap<int>> oldMap;
     oldMap.swap(map_);
     std::vector<std::vector<double>> oldData;
     oldData.swap(data_);
 
-    map_.resize(Lmax + 1);
-    lev_.clear(); ci_.clear(); cj_.clear(); parent_.clear();
+    // cells level by level, row-major within a level: the roots, then for each row of
+    // the previous level the lower children of its refined cells (left to right), then
+    // their upper children
+    lev_.clear(); ci_.clear(); cj_.clear(); parent_.clear(); child_.clear();
+    levelStart_.assign(Lmax + 2, 0);
+    auto add = [&](int L, int i, int j, int parent) {
+        lev_.push_back(L);
+        ci_.push_back(i);
+        cj_.push_back(j);
+        parent_.push_back(parent);
+        for (int k = 0; k < 4; ++k) child_.push_back(-1);
+    };
+    for (int j = 0; j < ny(0); ++j)
+        for (int i = 0; i < nx(0); ++i) add(0, i, j, -1);
     for (int L = 0; L <= Lmax; ++L) {
-        map_[L].assign((size_t)nx(L) * ny(L), -1);
-        for (int j = 0; j < ny(L); ++j)
-            for (int i = 0; i < nx(L); ++i) {
-                if (!exists[L][(size_t)j * nx(L) + i]) continue;
-                const int c = (int)lev_.size();
-                mapAt(L, i, j) = c;
-                lev_.push_back(L);
-                ci_.push_back(i);
-                cj_.push_back(j);
-                parent_.push_back(L > 0 ? mapAt(L - 1, i >> 1, j >> 1) : -1);
-                if (L > 0 && parent_.back() < 0) throw std::runtime_error("Mesh::rebuild: orphan cell");
-            }
+        const int b = levelStart_[L], e = levelStart_[L + 1] = (int)lev_.size();
+        if (L == Lmax) break;
+        for (int r0 = b, r1; r0 < e; r0 = r1) {
+            for (r1 = r0; r1 < e && cj_[r1] == cj_[r0]; ++r1) {}  // one row: [r0, r1)
+            for (int half = 0; half < 2; ++half)
+                for (int c = r0; c < r1; ++c) {
+                    const int i = 2 * ci_[c], j = 2 * cj_[c];
+                    if (!exists[L + 1].get(i, j)) continue;
+                    for (int k = 2 * half; k < 2 * half + 2; ++k) {
+                        if (!exists[L + 1].get(i + (k & 1), j + (k >> 1)))
+                            throw std::runtime_error("Mesh::rebuild: incomplete children");
+                        child_[4 * c + k] = (int)lev_.size();
+                        add(L + 1, i + (k & 1), j + (k >> 1), c);
+                    }
+                }
+        }
     }
     const int nc = (int)lev_.size();
-    child_.assign(4 * (size_t)nc, -1);
-    for (int c = 0; c < nc; ++c)
-        if (parent_[c] >= 0) child_[4 * parent_[c] + (ci_[c] & 1) + 2 * (cj_[c] & 1)] = c;
-    for (int c = 0; c < nc; ++c)
-        if (child_[4 * c] >= 0)
-            for (int k = 1; k < 4; ++k)
-                if (child_[4 * c + k] < 0) throw std::runtime_error("Mesh::rebuild: incomplete children");
+    size_t nExist = 0;
+    for (const auto& e : exists) nExist += e.count();
+    if (nExist != (size_t)nc) throw std::runtime_error("Mesh::rebuild: orphan cell");
+
+    map_.clear();
+    for (int L = 0; L <= Lmax; ++L) {
+        map_.emplace_back(nx(L), ny(L), -1);
+        for (int c = levelStart_[L]; c < levelStart_[L + 1]; ++c) map_[L].set(ci_[c], cj_[c], c);
+    }
 
     leaves_.clear();
     leafIdx_.assign(nc, -1);
@@ -158,25 +191,31 @@ void Mesh::rebuild(const std::vector<std::vector<uint8_t>>& exists) {
         }
 
     // ---- field transfer: copy cells that already existed, prolong new ones.
-    data_.assign(oldData.size(), std::vector<double>(nc, 0.0));
-    if (!oldData.empty()) {
+    const int nf = (int)oldData.size();
+    data_.assign(nf, std::vector<double>(nc, 0.0));
+    if (nf > 0) {
         std::vector<uint8_t> isNew(nc, 0);
+#pragma omp parallel for schedule(static) if (nc > kPar)
         for (int c = 0; c < nc; ++c) {
-            const int L = lev_[c];
-            const int o = oldMap.empty() ? -1 : oldMap[L][(size_t)cj_[c] * nx(L) + ci_[c]];
+            const int o = oldMap.empty() ? -1 : oldMap[lev_[c]].get(ci_[c], cj_[c]);
             if (o >= 0) {
-                for (size_t f = 0; f < data_.size(); ++f) data_[f][c] = oldData[f][o];
+                for (int f = 0; f < nf; ++f) data_[f][c] = oldData[f][o];
             } else {
                 isNew[c] = 1;
             }
         }
-        // cells are sorted by level: parents of level-L cells are final once we reach L
-        double out[4];
-        for (int c = 0; c < nc; ++c) {
-            if (child_[4 * c] < 0 || !isNew[child_[4 * c]]) continue;
-            for (size_t f = 0; f < data_.size(); ++f) {
-                prolong_[f](*this, data_[f], c, out);
-                for (int k = 0; k < 4; ++k) data_[f][child_[4 * c + k]] = out[k];
+        // parents level by level: the prolongation of a level-L parent reads cells of
+        // level <= L only, which are final once the coarser levels are done
+        for (int L = 0; L < Lmax; ++L) {
+            const int b = levelStart_[L], e = levelStart_[L + 1];
+#pragma omp parallel for schedule(dynamic, 256) if (e - b > kPar / 4)
+            for (int c = b; c < e; ++c) {
+                if (child_[4 * c] < 0 || !isNew[child_[4 * c]]) continue;
+                double out[4];
+                for (int f = 0; f < nf; ++f) {
+                    prolong_[f](*this, data_[f], c, out);
+                    for (int k = 0; k < 4; ++k) data_[f][child_[4 * c + k]] = out[k];
+                }
             }
         }
     }
@@ -184,9 +223,10 @@ void Mesh::rebuild(const std::vector<std::vector<uint8_t>>& exists) {
 }
 
 void Mesh::buildFaces() {
-    faces_.clear();
     const bool perX = cfg_.periodicX, perY = cfg_.periodicY;
-    for (int c : leaves_) {
+    // Faces owned by leaf c, in side order: boundary faces, faces towards a coarser leaf,
+    // and +x/+y faces towards a same-level leaf (the finer side owns 2:1 faces).
+    auto ownFaces = [&](int c, auto emit) {
         const int L = lev_[c], i = ci_[c], j = cj_[c];
         const double hh = h_[L];
         const Vec2 xc = center(c);
@@ -212,7 +252,7 @@ void Mesh::buildFaces() {
                 F.bside = s;
                 F.dist = 0.5 * hh;
                 if (plus) { F.L = c; F.R = -1; } else { F.L = -1; F.R = c; }
-                faces_.push_back(F);
+                emit(F);
                 continue;
             }
             int n = mapAt(L, a, b);
@@ -220,17 +260,38 @@ void Mesh::buildFaces() {
                 if (!isLeaf(n) || !plus) continue;  // finer side / other owner adds it
                 F.dist = hh;
                 F.L = c; F.R = n;
-                faces_.push_back(F);
+                emit(F);
             } else {
                 n = locate(L, a, b);  // coarser leaf (level L-1 by balance)
                 F.dist = 0.5 * hh + 0.5 * h_[lev_[n]];
                 if (plus) { F.L = c; F.R = n; } else { F.L = n; F.R = c; }
-                faces_.push_back(F);
+                emit(F);
             }
+        }
+    };
+    // the faces are listed leaf by leaf: one pass on small meshes, else count, prefix
+    // sum and fill in parallel
+    const int nl = nLeaves();
+    if (nl <= kPar) {
+        faces_.clear();
+        for (int c : leaves_) ownFaces(c, [&](const Face& F) { faces_.push_back(F); });
+    } else {
+        std::vector<int> off(nl + 1, 0);
+#pragma omp parallel for schedule(static)
+        for (int k = 0; k < nl; ++k) {
+            int cnt = 0;
+            ownFaces(leaves_[k], [&](const Face&) { ++cnt; });
+            off[k + 1] = cnt;
+        }
+        for (int k = 0; k < nl; ++k) off[k + 1] += off[k];
+        faces_.resize(off[nl]);
+#pragma omp parallel for schedule(static)
+        for (int k = 0; k < nl; ++k) {
+            int q = off[k];
+            ownFaces(leaves_[k], [&](const Face& F) { faces_[q++] = F; });
         }
     }
     // CSR cell -> faces
-    const int nl = nLeaves();
     cellFaceOff_.assign(nl + 1, 0);
     for (const Face& F : faces_) {
         if (F.L >= 0) cellFaceOff_[leafIdx_[F.L] + 1]++;
@@ -252,20 +313,22 @@ bool Mesh::adapt(const std::vector<int>& flags) {
     const int Lmax = cfg_.maxLevel, Lmin = cfg_.minLevel;
     for (auto& d : data_) restrict(d);
 
-    std::vector<std::vector<uint8_t>> ex(Lmax + 1);
-    for (int L = 0; L <= Lmax; ++L) {
-        ex[L].assign((size_t)nx(L) * ny(L), 0);
-    }
-    for (int c = 0; c < nCells(); ++c) ex[lev_[c]][(size_t)cj_[c] * nx(lev_[c]) + ci_[c]] = 1;
-    auto E = [&](int L, int i, int j) -> uint8_t& { return ex[L][(size_t)j * nx(L) + i]; };
+    std::vector<TileMap<uint8_t>> ex;
+    for (int L = 0; L <= Lmax; ++L) ex.emplace_back(nx(L), ny(L), 0);
+    for (int c = 0; c < nCells(); ++c) ex[lev_[c]].set(ci_[c], cj_[c], 1);
+    auto E = [&](int L, int i, int j) { return ex[L].get(i, j); };
+    // set the 4 siblings of (L,i,j) to v
+    auto setSiblings = [&](int L, int i, int j, uint8_t v) {
+        const int pi = i & ~1, pj = j & ~1;
+        for (int k = 0; k < 4; ++k) ex[L].set(pi + (k & 1), pj + (k >> 1), v);
+    };
     bool changed = false;
 
     // create the 4 children of (L,i,j) (and, recursively, any missing ancestors)
     std::function<void(int, int, int)> ensure = [&](int L, int i, int j) {
         if (E(L, i, j)) return;
         ensure(L - 1, i >> 1, j >> 1);
-        const int pi = i & ~1, pj = j & ~1;
-        E(L, pi, pj) = E(L, pi + 1, pj) = E(L, pi, pj + 1) = E(L, pi + 1, pj + 1) = 1;
+        setSiblings(L, i, j, 1);
         changed = true;
     };
 
@@ -286,17 +349,17 @@ bool Mesh::adapt(const std::vector<int>& flags) {
         }
         return true;
     };
+    // (ensure() at level L-1 only adds cells at levels < L, so ex[L] is stable while
+    // it is traversed; the result is the closure, independent of the traversal order)
     for (int L = Lmax; L >= 2; --L) {
-        for (int j = 0; j < ny(L); j += 2)
-            for (int i = 0; i < nx(L); i += 2) {
-                if (!E(L, i, j)) continue;
-                const int pi = i >> 1, pj = j >> 1;
-                for (int dj = -1; dj <= 1; ++dj)
-                    for (int di = -1; di <= 1; ++di) {
-                        int a = pi + di, b = pj + dj;
-                        if ((di || dj) && wrapOk(L - 1, a, b)) ensure(L - 1, a, b);
-                    }
-            }
+        ex[L].forEach([&](int i, int j, uint8_t) {  // one of each 4 siblings
+            const int pi = i >> 1, pj = j >> 1;
+            for (int dj = -1; dj <= 1; ++dj)
+                for (int di = -1; di <= 1; ++di) {
+                    int a = pi + di, b = pj + dj;
+                    if ((di || dj) && wrapOk(L - 1, a, b)) ensure(L - 1, a, b);
+                }
+        }, 2);
     }
     // 3. coarsening: parents whose 4 children are flagged leaves
     for (int p = 0; p < nCells(); ++p) {
@@ -309,8 +372,8 @@ bool Mesh::adapt(const std::vector<int>& flags) {
         }
         if (!ok) continue;
         // children must still be leaves after refinement/balance
-        if (Lp + 2 <= Lmax && E(Lp + 2, 4 * i, 4 * j) | E(Lp + 2, 4 * i + 2, 4 * j) |
-                                  E(Lp + 2, 4 * i, 4 * j + 2) | E(Lp + 2, 4 * i + 2, 4 * j + 2))
+        if (Lp + 2 <= Lmax && (E(Lp + 2, 4 * i, 4 * j) | E(Lp + 2, 4 * i + 2, 4 * j) |
+                               E(Lp + 2, 4 * i, 4 * j + 2) | E(Lp + 2, 4 * i + 2, 4 * j + 2)))
             continue;
         // no neighbour of p may have grandchildren
         if (Lp + 2 <= Lmax) {
@@ -325,7 +388,7 @@ bool Mesh::adapt(const std::vector<int>& flags) {
                 }
         }
         if (!ok) continue;
-        for (int k = 0; k < 4; ++k) E(Lp + 1, 2 * i + (k & 1), 2 * j + (k >> 1)) = 0;
+        setSiblings(Lp + 1, 2 * i, 2 * j, 0);
         changed = true;
     }
     if (!changed) return false;

@@ -207,7 +207,7 @@ static void testCases() {
         Mesh::Config cfg;
         cfg.minLevel = 2; cfg.maxLevel = 2;
         Mesh m(cfg);
-        const int c = m.leaves()[5];   // (1,1): [0.25,0.5]^2
+        const int c = m.find(2, 1, 1);   // [0.25,0.5]^2
         CHECK(cases::cellFraction(m, c, [](double, double) { return 1.0; }) == 1.0, "pure");
         const double fr = cases::cellFraction(m, c, [](double x, double y) { return 0.75 - x - y; });
         CHECK(std::fabs(fr - 0.5) < 1e-12, "diagonal half cell %.15f", fr);
