@@ -221,16 +221,19 @@ python3 scripts/make_video.py output/video_rayleigh_taylor --height 10 --dpi 100
 [![breaking wave](docs/media/breaking_wave.gif)](docs/media/breaking_wave.mp4)
 
 A steep Stokes wave (ε = 0.55, Re = 40000, Bo = 1000, density ratio 850) overturns, plunges,
-traps air and breaks up over 4 wave periods (levels 4–10, finest level as in Deike et al.;
-momentum-conserving advection; 20k–45k leaves, 32,959 steps, 33 min on 8 cores). The
-top-right panel compares the energy budget with the literature: 77 % of the wave energy
+traps air and breaks up over 4 wave periods (levels 4–9, momentum-conserving advection).
+The top-right panel compares the energy budget with the literature: 84 % of the wave energy
 dissipated after 4 periods vs ≈ 70 % in Deike et al. (Chen et al. 1999: ≈ 80 %, Iafrati
 2011: ≈ 60 %).
 
 ```bash
-OMP_NUM_THREADS=8 ./bin/vof2d cases/breaking_wave.cfg maxLevel=10 outDir=output/breaking_wave_L4_10
-python3 scripts/make_video.py output/breaking_wave_L4_10 --wave-energy --fps 20 --dpi 100 --arrows 16 --arrow-umax 1.0
+./bin/vof2d cases/breaking_wave.cfg outDir=output/breaking_wave_deike2015
+python3 scripts/make_video.py output/breaking_wave_deike2015 --wave-energy --fps 20 --dpi 100 --arrows 16 --arrow-umax 1.0
 ```
+
+At level 10 the breaking sheets fragment into droplets smaller than a cell, which the
+surface-tension force can propel unphysically (one rose to the top wall at levels 4–10);
+add `rejectUnresolvedCurvature=true` to such runs (see Validation and Limitations).
 
 ## Validation (results from this code)
 
@@ -263,15 +266,18 @@ Unit tests (`make check`):
   (t/T in [1, 2]) vs ≈70% and 0.22 in the paper (Chen et al. 1999 ≈80%, Iafrati 2011
   ≈60%):
 
-  | levels | leaves | wall (8 cores) | dissipated | decay rate |
-  |---|---:|---:|---:|---:|
-  | 4–9 (default) | 11k–22k | 11 min | 84% | 0.27 |
-  | 4–10 | 20k–45k | 33 min | 77% | 0.25 |
-  | 8–10 | 81k–101k | 53 min | 77% | 0.23 |
+  | levels | leaves | wall (8 cores) | dissipated | decay rate | airborne liquid |
+  |---|---:|---:|---:|---:|---|
+  | 4–9 (default) | 11k–22k | 11 min | 84% | 0.27 | none above the crest |
+  | 4–10 | 20k–45k | 33 min | 77% | 0.25 | sub-cell fragment rises to the top wall |
+  | 4–10, `rejectUnresolvedCurvature=true` | 20k–52k | 37 min | 83% | 0.27 | splash droplet to y = 0.94, falls back |
+  | 8–10 | 81k–101k | 53 min | 77% | 0.23 | droplet to y = 1.08, falls back |
 
-  The finest level sets the dissipation; a finer background mesh only brings the decay
-  rate a little closer. Breaking starts at t/T ≈ 0.6 vs ≈ 1. The paper used level 10 and
-  a vortex sheet in the air at t = 0 (here: air at rest). `make_video.py --wave-energy`
+  Breaking starts at t/T ≈ 0.6 vs ≈ 1 in all runs. Multithreaded runs are not bitwise
+  reproducible, and after breaking the flow is chaotic: the spread between repeated runs
+  has not been measured, so differences of a few percent between these rows (e.g. 77% vs
+  83% at levels 4–10) are not attributed to the settings. The paper used level 10 and a
+  vortex sheet in the air at t = 0 (here: air at rest). `make_video.py --wave-energy`
   plots it.
 * Hydrostatics, density ratio 1000 on AMR with regridding: |u| ≤ 1e-11.
 * Taylor–Green vortex: 2nd order (uniform and AMR); lid-driven cavity Re=100 within
@@ -316,6 +322,15 @@ docs/ARCHITECTURE.md  design notes and conventions
   only ~10–20 %.
 * CUDA: only the linear solves run on the GPU, and only for systems of ≥ 120,000 unknowns.
 * `maxLevel` ≤ 14 (index range of the mesh); memory is ~1.3–1.5 kB per leaf.
+* Fragments smaller than about one cell (spray, micro-bubbles in breaking waves at level
+  10) are not resolved: their curvature estimate is wrong (clamped at |κ| = 1/h, of either
+  sign), so the surface-tension force can propel them, e.g. a droplet levitating instead
+  of falling. `rejectUnresolvedCurvature = true` drops the force where the curvature
+  exceeds 1/h, which removes the clamped values (the levitating droplet then falls) and
+  leaves resolved interfaces unchanged; it is a partial remedy, since smaller wrong values
+  on fragments of 0.4–1.5 cells remain. Off by default.
+* Runs with more than one thread are not bitwise reproducible (the order in which OpenMP
+  combines the threads' partial sums varies); single-threaded runs are.
 
 ## Figures
 

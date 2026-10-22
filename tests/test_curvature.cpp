@@ -350,6 +350,50 @@ int main() {
                     st[3], st[4], st[5], st[6], okAll ? "finite, bounded" : "BAD");
         require(okAll, "random fields: NaN/Inf or |kappa| > 1/h");
     }
+    // ---- rejectUnresolved: a sub-cell droplet gets no curvature (by default the methods
+    //      clamp to |kappa h| = 1, with mixed signs); resolved interfaces are unchanged
+    {
+        Mesh::Config cfg;
+        cfg.minLevel = 7;
+        cfg.maxLevel = 7;
+        Mesh m(cfg);
+        const double h = m.size(m.leaves()[0]);
+        auto disk = [&](double xc, double yc, double r) {
+            std::vector<double> f(m.nCells(), 0.0);
+            constexpr int N = 64;  // sub-samples per direction
+            for (int c : m.leaves()) {
+                const Vec2 x = m.center(c);
+                if (std::hypot(x.x - xc, x.y - yc) > r + h) continue;
+                int in = 0;
+                for (int b = 0; b < N; ++b)
+                    for (int a = 0; a < N; ++a)
+                        in += std::hypot(x.x + ((a + 0.5) / N - 0.5) * h - xc, x.y + ((b + 0.5) / N - 0.5) * h - yc) < r;
+                f[c] = double(in) / (N * N);
+            }
+            return f;
+        };
+        // (a position where the default methods hit the clamp; at others they give smaller
+        //  wrong values, which rejectUnresolved does not remove)
+        const std::vector<double> small = disk(0.5 + 0.3 * h, 0.5 + 0.3 * h, 0.4 * h);
+        std::vector<double> k0, k1;
+        curvature::compute(m, small, k0);
+        curvature::compute(m, small, k1, true);
+        double max0 = 0.0, max1 = 0.0;
+        for (int c : m.leaves()) {
+            max0 = std::max(max0, std::fabs(k0[c]) * h);
+            max1 = std::max(max1, std::fabs(k1[c]) * h);
+        }
+        const std::vector<double> big = disk(0.5013, 0.4987, 8 * h);
+        curvature::compute(m, big, k0);
+        curvature::compute(m, big, k1, true);
+        bool same = true;
+        for (int c : m.leaves()) same = same && k0[c] == k1[c];
+        std::printf("droplet r = 0.4 h: max |kappa h| %.2f (default), %.2f (rejectUnresolved); r = 8 h: %s\n", max0,
+                    max1, same ? "identical" : "DIFFERENT");
+        require(max0 > 0.99, "default: sub-cell droplet hits the curvature clamp");
+        require(max1 == 0.0, "rejectUnresolved: sub-cell droplet gets no curvature");
+        require(same, "rejectUnresolved: resolved droplet unchanged");
+    }
     // ---- timing on a large uniform mesh
     {
         Ellipse E(0.5123, 0.4871, 0.25, 0.25);

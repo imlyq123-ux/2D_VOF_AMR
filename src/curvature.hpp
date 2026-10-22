@@ -22,8 +22,13 @@ namespace curvature {
 //  * The interface region is assumed to be at the maximum level with a buffer of at
 //    least 3-4 cells (guaranteed by the AMR criterion); at walls neighbour data are
 //    mirrored by Mesh::locate (90 degree contact angle).
+//  * |kappa| is limited to 1/h (radius of curvature at least one cell). By default a
+//    larger value is clamped to that limit. With rejectUnresolved, a method that gives
+//    a larger value counts as failed instead (next fallback, else 0): see the comment
+//    at KMAX in curvature.cpp for why (Params::rejectUnresolvedCurvature).
 // Calls m.restrict on an internal copy of f when it needs parent values.
-void compute(const Mesh& m, const std::vector<double>& f, std::vector<double>& kappa);
+void compute(const Mesh& m, const std::vector<double>& f, std::vector<double>& kappa,
+             bool rejectUnresolved = false);
 
 // Counters of the last compute() call (cells per method / fallback), see curvature.cpp.
 void lastStats(long out[8]);

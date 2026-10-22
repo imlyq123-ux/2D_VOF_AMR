@@ -83,7 +83,8 @@ void advectConserving(State& s, double dt) {
 void refreshDerived(State& s, const cases::CaseSetup& cs, bool project) {
     if (twoPhaseFlow(s)) {
         ns::updateProperties(s);
-        if (s.prm.sigma != 0.0) curvature::compute(s.m(), s.F(s.id.f), s.F(s.id.kappa));
+        if (s.prm.sigma != 0.0)
+            curvature::compute(s.m(), s.F(s.id.f), s.F(s.id.kappa), s.prm.rejectUnresolvedCurvature);
         if (project) ns::reproject(s);
     } else {
         faceVelocityFromStreamFunction(s.m(), cs, s.t, s.uf);
@@ -172,7 +173,8 @@ void step(State& s, const cases::CaseSetup& cs, double dtLimit) {
         {
             PhaseTimer timer(kProperties);
             ns::updateProperties(s);
-            if (prm.sigma != 0.0) curvature::compute(m, s.F(s.id.f), s.F(s.id.kappa));
+            if (prm.sigma != 0.0)
+                curvature::compute(m, s.F(s.id.f), s.F(s.id.kappa), prm.rejectUnresolvedCurvature);
         }
         // MAC-projected, time-centred advection velocity for the momentum (the momentum is
         // already transported by the VOF fluxes in conserving mode)

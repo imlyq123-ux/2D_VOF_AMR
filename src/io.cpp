@@ -114,6 +114,8 @@ void forEachParam(P& p, Fn&& fn) {
     fn(nullptr, "mu1", p.mu1, "dynamic viscosity of phase 1");
     fn(nullptr, "mu2", p.mu2, "dynamic viscosity of phase 2");
     fn(nullptr, "sigma", p.sigma, "surface tension coefficient");
+    fn(nullptr, "rejectUnresolvedCurvature", p.rejectUnresolvedCurvature,
+       "no surface tension on sub-cell structures (true/false)");
     fn(nullptr, "gx", p.gx, "gravity x");
     fn(nullptr, "gy", p.gy, "gravity y");
 

@@ -33,6 +33,11 @@ struct Params {
     double rho1 = 1.0, rho2 = 1.0;
     double mu1 = 0.0, mu2 = 0.0;
     double sigma = 0.0;
+    // Surface tension only where the curvature is resolved (|kappa| h <= 1): structures
+    // smaller than a cell get no surface-tension force instead of a clamped, mixed-sign
+    // one that can propel them (see curvature.hpp). Recommended for maxLevel >= 10 runs
+    // that fragment into sub-cell droplets and bubbles.
+    bool rejectUnresolvedCurvature = false;
     double gx = 0.0, gy = 0.0;
 
     // ---- time integration

@@ -17,9 +17,10 @@
 //      (then 5x5) block -> parabola.
 //   6. Average of the curvatures of the neighbouring (3x3) interfacial leaves that
 //      succeeded, else 0.
-// |kappa| is clamped to KMAX / h. Non-interfacial leaves having a face neighbour with a
-// different f get the mean curvature of the interfacial leaves of their 3x3 (else 5x5)
-// block at their level; all other leaves (and non-leaf cells) get 0.
+// |kappa| is clamped to KMAX / h, or rejected beyond it with rejectUnresolved (see KMAX).
+// Non-interfacial leaves having a face neighbour with a different f get the mean
+// curvature of the interfacial leaves of their 3x3 (else 5x5) block at their level; all
+// other leaves (and non-leaf cells) get 0.
 #include "curvature.hpp"
 
 #include <algorithm>
@@ -40,7 +41,27 @@ namespace {
 
 constexpr double EPS = vof::EPS;
 constexpr int NMAX = 5;        // max cells walked from the row of c in each direction
-constexpr double KMAX = 1.0;   // |kappa| <= KMAX / h(level)
+// |kappa| <= KMAX / h(level).
+//
+// Unresolved structures (Params::rejectUnresolvedCurvature). For a fragment smaller than
+// a cell (droplet or bubble of radius < h) the height functions and fits do not see a
+// closed interface: they return values of either sign that hit the clamp, e.g.
+// kappa h in [-1, +1] on neighbouring cells of a droplet of radius 0.4 h whose exact
+// kappa h is +2.5 everywhere. The balanced-force term sigma kappa_f grad_f f then no
+// longer integrates to zero around the fragment and propels it: in the breaking wave at
+// levels 4-10 a fragment of 0.4 h radius received net surface-tension kicks of 4-11 g,
+// rose against gravity and stuck to the top wall, and an isolated droplet of 0.4 h
+// launched upward in still air levitated instead of falling (it falls with sigma = 0,
+// and droplets of >= 3 h follow the ballistic path either way). With rejectUnresolved
+// a method whose |kappa| exceeds the limit counts as failed (next fallback, else
+// kappa = 0): the clamped values disappear, and with them the fragment at the top wall
+// (the 0.4 h droplet then falls); resolved interfaces are unchanged (identical results
+// for droplets of >= 3 h). It is a partial remedy: depending on the position on the
+// grid, the fits can also return wrong values below the limit for fragments of
+// 0.4-1.5 h, which are kept (a 1.2 h droplet in the levels 4-10 wave still hovered
+// for ~1 time unit before falling). Off by default: it changes results only on meshes
+// that produce sub-cell fragments.
+constexpr double KMAX = 1.0;
 constexpr double HMAX = 1.5;   // mixed fit: heights must fall inside the 3x3 block
 
 enum Method { HF_MAIN = 0, HF_OTHER, MIXED, CENTROID, NEIGHBOUR, NONE, NMETHODS };
@@ -208,10 +229,12 @@ bool fitParabola(const Points& P, Vec2 n, double& kap) {
     return std::isfinite(kap);
 }
 
-// Curvature of interfacial leaf c (physical units, clamped). Returns the Method used.
-int cellKappa(const Mesh& m, const double* fr, int c, double& kap) {
+// Curvature of interfacial leaf c (physical units, |kap| <= KMAX / h). Returns the Method
+// used; with reject, a method whose value exceeds the limit fails instead of clamping.
+int cellKappa(const Mesh& m, const double* fr, int c, bool reject, double& kap) {
     const int L = m.level(c), i = m.ix(c), j = m.iy(c);
     const double h = m.h(L), kmax = KMAX / h;
+    auto accept = [&](double k) { return !reject || (std::isfinite(k) && std::fabs(k) <= kmax); };
     const Stencil S{m, fr, L};
     const Vec2 n = youngs(S, i, j);
     const int d0 = std::fabs(n.x) > std::fabs(n.y) ? 0 : 1;
@@ -231,7 +254,7 @@ int cellKappa(const Mesh& m, const double* fr, int c, double& kap) {
             const double hp = 0.5 * (H[d][2] - H[d][0]);
             const double hpp = H[d][2] - 2.0 * H[d][1] + H[d][0];
             const double k = -s * hpp / (h * std::pow(1.0 + hp * hp, 1.5));
-            if (std::isfinite(k)) {
+            if (std::isfinite(k) && accept(k)) {
                 kap = std::clamp(k, -kmax, kmax);
                 return pass == 0 ? HF_MAIN : HF_OTHER;
             }
@@ -250,7 +273,7 @@ int cellKappa(const Mesh& m, const double* fr, int c, double& kap) {
             if (d == 0) P.add(H[d][q], q - 1.0, 1.0);
             else P.add(q - 1.0, H[d][q], 1.0);
         }
-    if (fitParabola(P, nu, k)) {
+    if (fitParabola(P, nu, k) && accept(k / h)) {
         kap = std::clamp(k / h, -kmax, kmax);
         return MIXED;
     }
@@ -266,7 +289,7 @@ int cellKappa(const Mesh& m, const double* fr, int c, double& kap) {
                 if (plicCentroid(S, i + a, j + b, fa, cx, cy, len))
                     C.add(a + cx, b + cy, std::max(len, 1e-3));
             }
-        if (fitParabola(C, nu, k)) {
+        if (fitParabola(C, nu, k) && accept(k / h)) {
             kap = std::clamp(k / h, -kmax, kmax);
             return CENTROID;
         }
@@ -313,7 +336,7 @@ void lastStats(long out[8]) {
     for (int k = 0; k < 8; ++k) out[k] = gStats[k];
 }
 
-void compute(const Mesh& m, const std::vector<double>& f, std::vector<double>& kappa) {
+void compute(const Mesh& m, const std::vector<double>& f, std::vector<double>& kappa, bool rejectUnresolved) {
     Workspace& W = tWork;  // bind before parallel regions (thread_local!)
     const int nc = m.nCells();
     if ((int)kappa.size() != nc) kappa.assign(nc, 0.0);
@@ -339,7 +362,7 @@ void compute(const Mesh& m, const std::vector<double>& f, std::vector<double>& k
     for (int q = 0; q < ni; ++q) {
         const int c = ifc[q];
         double k = 0.0;
-        const int meth = cellKappa(m, frp, c, k);
+        const int meth = cellKappa(m, frp, c, rejectUnresolved, k);
         method[q] = (int8_t)meth;
         kappa[c] = std::isfinite(k) ? k : 0.0;
         if (meth != NONE) has[c] = 1;
