@@ -225,7 +225,7 @@ bool setupCase(const std::string& name, Params& prm, CaseSetup& cs) {
     } else if (name == "dam_break") {
         // Martin & Moyce (1952): water column a = 0.05715 m wide, 2a high, in the lower
         // left corner of a closed square box of side 5a = 0.28575 m (the front reaches
-        // the right wall at T = t sqrt(2g/a) ~ 3.5, after the M&M data range Z = x/a <= 4).
+        // the right wall at T = t sqrt(2g/a) ~ 3.7, after the M&M data range Z = x/a <= 4).
         // Water (phase 1) rho 1000, mu 1e-3; air rho 1.2, mu 1.8e-5; sigma 0.0728; g 9.81.
         const double a = 0.05715;
         d.L0 = 5.0 * a;

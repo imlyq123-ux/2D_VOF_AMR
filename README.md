@@ -252,6 +252,23 @@ uniform 128² mesh, with 4× fewer cells and 2.2× less wall time. Volume drift 
 Test case 2 (level 8): rise-velocity maxima 0.2506 @ 0.735 and 0.2378 @ 2.00
 (reference 0.2502 @ 0.732, 0.2393 @ 2.06), centroid y(3) = 1.130 (ref. ≈ 1.138).
 
+Dam break, Martin & Moyce (1952), column a × 2a (n² = 2, a = 2.25 in): surge front
+Z = x/a against T = t √(2g/a), experimental points as tabulated in the dam-break example
+of the Lethe code. The simulation leads the experiment by a nearly constant ΔT ≈ 0.18, the
+usual offset attributed to the release of the gate; with the simulated T shifted by 0.175
+the front agrees to rms ΔZ = 0.048 (levels 4–8, default, h = a/51) and 0.046 (levels 4–9,
+h = a/102), max |ΔZ| ≤ 0.08 over 0.4 ≤ T ≤ 3.0; unshifted the front is ahead by ΔZ ≈ 0.2.
+The late front speed dZ/dT is 1.36–1.38 vs 1.34 measured. Both levels agree within
+ΔZ = 0.04, and the front reaches the far wall (Z = 5) at T = 3.7.
+
+![dam break front](docs/images/dam_break_front.png)
+
+```bash
+./bin/vof2d cases/dam_break.cfg tEnd=0.2 outputEvery=0.002 outDir=output/dam_break_mm_L8
+./bin/vof2d cases/dam_break.cfg tEnd=0.2 outputEvery=0.002 maxLevel=9 outDir=output/dam_break_mm_L9
+python3 scripts/dam_break_front.py output/dam_break_mm_L8 output/dam_break_mm_L9 --labels "levels 4–8 (default)" "levels 4–9"
+```
+
 Unit tests (`make check`):
 
 * VOF single vortex (T = 8): L1 shape error 2.1e-3 (128²), 5.4e-4 (256²), order ≈ 2;
@@ -340,6 +357,8 @@ docs/ARCHITECTURE.md  design notes and conventions
   Zalesak disk after one revolution
 * `docs/images/breaking_wave_energy.png` — breaking wave after 4 periods: AMR grid, fields
   and the energy budget against Deike et al. (2015)
+* `docs/images/dam_break_front.png` — dam-break surge front against Martin & Moyce (1952)
+  (`scripts/dam_break_front.py`)
 
 ## Acknowledgements and references
 
